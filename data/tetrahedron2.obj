@@ -1,0 +1,9 @@
+# Regular tetrahedron (slightly different orientation)
+v 0.0005 0.12364 0.216
+v 0.11 -0.11 -0.11
+v -0.333 0.444 -0.11
+v -0.11 -0.11 0.8246
+f 1 2 3
+f 1 2 4
+f 1 3 4
+f 2 3 4

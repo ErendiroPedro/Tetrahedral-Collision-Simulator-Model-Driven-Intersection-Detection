@@ -35,7 +35,7 @@ class SimulationConfig:
     default_color_a: List[float] = None
     default_color_b: List[float] = None
     collision_color: List[float] = None
-    batch_size: int = 2048
+    batch_size: int = 32768  # Adjusted for memory efficiency
 
     def __post_init__(self):
         if self.initial_offset is None: self.initial_offset = np.array([3.0, 0.0, 0.0])
@@ -339,7 +339,7 @@ def main():
     except Exception as e:
         logger.error(f"Failed to load PyTorch model: {e}")
 
-    if not simulator.load_meshes("data/mug.obj", "data/soccerball.obj"):
+    if not simulator.load_meshes("data/armadillo.obj", "data/armadillo.obj"):
         return
     
     simulator.initialize_visualization()
