@@ -16,7 +16,6 @@ import torch
 import polyscope as ps
 import polyscope.imgui as psim
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_agg import FigureCanvasAgg
 import logging
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
@@ -24,6 +23,24 @@ from dataclasses import dataclass
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+# Collision detection threshold
+COLLISION_THRESHOLD = 0.5
+
+# Tetrahedron edge radius for visualization
+WIREFRAME_RADIUS = 0.02
+
+# Colors (RGB)
+COLOR_STATIONARY = (0.2, 0.5, 0.9)    # Blue
+COLOR_COLLISION = (1.0, 0.2, 0.2)      # Red
+COLOR_NO_COLLISION = (0.2, 0.8, 0.2)   # Green
+
+# Tetrahedron edges (6 edges connecting 4 vertices)
+TETRAHEDRON_EDGES = np.array([(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)])
 
 
 @dataclass
@@ -87,9 +104,9 @@ def create_default_tetrahedron() -> np.ndarray:
     ], dtype=np.float64)
 
 
-def get_tetrahedron_edges() -> List[Tuple[int, int]]:
-    """Return the 6 edges of a tetrahedron as vertex index pairs."""
-    return [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+# =============================================================================
+# Tetrahedron Utilities
+# =============================================================================
 
 
 class ConfidenceVisualizer:
@@ -102,13 +119,12 @@ class ConfidenceVisualizer:
         self.tet_stationary: Optional[np.ndarray] = None  # (4, 3)
         self.tet_moving_base: Optional[np.ndarray] = None  # (4, 3) - base position
         
-        # Step data
+        # Trajectory data
         self.x_positions: np.ndarray = np.array([])
-        self.confidence_history: List[float] = []  # Always grows - records every computation
-        
-        # Current state
         self.current_step: int = 0
-        self.last_recorded_step: int = -1  # Track last step we recorded to avoid duplicates
+        
+        # Confidence history (append-only - records every computation)
+        self.confidence_history: List[float] = []
         
     def load_model(self, model_path: str) -> bool:
         """Load the PyTorch collision detection model."""
@@ -195,150 +211,169 @@ class ConfidenceVisualizer:
         return float(confidence)
     
     def initialize_steps(self):
-        """Initialize the step positions."""
+        """Initialize the trajectory step positions and reset history."""
         x_min, x_max = self.config.x_range
         self.x_positions = np.linspace(x_min, x_max, self.config.num_positions)
         self.confidence_history = []
         self.current_step = 0
-        self.last_recorded_step = -1
-        logger.info(f"Initialized {self.config.num_positions} steps from x={x_min} to x={x_max}")
+        logger.info(f"Initialized {self.config.num_positions} steps from x={x_min:.2f} to x={x_max:.2f}")
     
-    def get_current_confidence(self) -> float:
-        """Get confidence for current step position."""
-        x_offset = self.x_positions[self.current_step]
+    def _get_moved_tetrahedron(self, step: int) -> np.ndarray:
+        """Get the moving tetrahedron at a specific step position."""
+        x_offset = self.x_positions[step]
         tet_moved = self.tet_moving_base.copy()
         tet_moved[:, 0] += x_offset
+        return tet_moved
+    
+    def get_current_confidence(self) -> float:
+        """Compute and return confidence for current step position."""
+        tet_moved = self._get_moved_tetrahedron(self.current_step)
         return self.compute_confidence(self.tet_stationary, tet_moved)
     
     def update_history_for_step(self, new_step: int):
-        """Update confidence history when step changes - append only, never delete."""
-        old_step = self.current_step
-        self.current_step = new_step
+        """Update step and append confidence to history (append-only, never deletes)."""
+        if new_step == self.current_step:
+            return
         
-        # Only append if step actually changed
-        if new_step != old_step:
-            # Always compute and append the new confidence value
-            x_offset = self.x_positions[new_step]
-            tet_moved = self.tet_moving_base.copy()
-            tet_moved[:, 0] += x_offset
-            conf = self.compute_confidence(self.tet_stationary, tet_moved)
-            self.confidence_history.append(conf)
+        self.current_step = new_step
+        tet_moved = self._get_moved_tetrahedron(new_step)
+        conf = self.compute_confidence(self.tet_stationary, tet_moved)
+        self.confidence_history.append(conf)
     
     def precompute_all_confidences(self):
-        """Precompute all confidence values (used for export)."""
+        """Precompute all confidence values along the trajectory (used for export)."""
         logger.info("Precomputing all confidence values...")
         
-        x_min, x_max = self.config.x_range
-        self.x_positions = np.linspace(x_min, x_max, self.config.num_positions)
-        self.confidence_history = []
+        self.initialize_steps()
         
-        for i, x_offset in enumerate(self.x_positions):
-            tet_moved = self.tet_moving_base.copy()
-            tet_moved[:, 0] += x_offset
+        for step in range(self.config.num_positions):
+            tet_moved = self._get_moved_tetrahedron(step)
             conf = self.compute_confidence(self.tet_stationary, tet_moved)
             self.confidence_history.append(conf)
         
         logger.info(f"Precomputed {len(self.confidence_history)} confidence values")
         logger.info(f"Confidence range: [{min(self.confidence_history):.3f}, {max(self.confidence_history):.3f}]")
     
-    def get_current_moving_tet(self) -> np.ndarray:
-        """Get the current position of the moving tetrahedron."""
-        x_offset = self.x_positions[self.current_step]
-        tet_moved = self.tet_moving_base.copy()
-        tet_moved[:, 0] += x_offset
-        return tet_moved
+    # =========================================================================
+    # Polyscope Visualization
+    # =========================================================================
     
     def initialize_polyscope(self):
-        """Initialize Polyscope visualization."""
+        """Initialize Polyscope visualization with both tetrahedra."""
         ps.init()
         ps.set_up_dir("y_up")
         ps.set_ground_plane_mode("none")
         
-        # Register stationary tetrahedron as curve network (wireframe)
-        edges = get_tetrahedron_edges()
-        edge_array = np.array(edges)
-        
+        # Register stationary tetrahedron (wireframe)
         ps_stationary = ps.register_curve_network(
             "Stationary Tetrahedron",
             self.tet_stationary,
-            edge_array
+            TETRAHEDRON_EDGES
         )
-        ps_stationary.set_color([0.2, 0.5, 0.9])  # Blue
-        ps_stationary.set_radius(0.02)
+        ps_stationary.set_color(COLOR_STATIONARY)
+        ps_stationary.set_radius(WIREFRAME_RADIUS)
         
         # Register moving tetrahedron
-        initial_moving = self.get_current_moving_tet()
         ps_moving = ps.register_curve_network(
             "Moving Tetrahedron",
-            initial_moving,
-            edge_array
+            self._get_moved_tetrahedron(self.current_step),
+            TETRAHEDRON_EDGES
         )
-        ps_moving.set_color([0.9, 0.5, 0.2])  # Orange
-        ps_moving.set_radius(0.02)
+        ps_moving.set_color(COLOR_NO_COLLISION)
+        ps_moving.set_radius(WIREFRAME_RADIUS)
         
         logger.info("Polyscope visualization initialized")
     
     def update_visualization(self):
-        """Update the moving tetrahedron position in Polyscope."""
-        moving_tet = self.get_current_moving_tet()
-        edges = np.array(get_tetrahedron_edges())
-        
-        # Get current confidence
+        """Update the moving tetrahedron position and color based on collision state."""
         current_conf = self.get_current_confidence()
-        is_collision = current_conf > 0.5
+        is_collision = current_conf > COLLISION_THRESHOLD
         
-        # Re-register to update position
+        # Re-register to update position (Polyscope requires re-registration)
         ps_moving = ps.register_curve_network(
             "Moving Tetrahedron",
-            moving_tet,
-            edges
+            self._get_moved_tetrahedron(self.current_step),
+            TETRAHEDRON_EDGES
         )
-        # Red if collision detected, green otherwise
+        ps_moving.set_color(COLOR_COLLISION if is_collision else COLOR_NO_COLLISION)
+        ps_moving.set_radius(WIREFRAME_RADIUS)
+    
+    # =========================================================================
+    # UI Components
+    # =========================================================================
+    
+    def _render_status_panel(self, confidence: float, x_position: float):
+        """Render the status information panel."""
+        is_collision = confidence > COLLISION_THRESHOLD
+        
+        # Colors for collision state
+        color_red = (1.0, 0.4, 0.4, 1.0)
+        color_green = (0.4, 1.0, 0.4, 1.0)
+        color_info = (0.7, 0.85, 1.0, 1.0)
+        
+        psim.Text("Step")
+        psim.SameLine()
+        psim.TextColored(color_info, f"{self.current_step + 1} / {self.config.num_positions}")
+        
+        psim.Text("Position")
+        psim.SameLine()
+        psim.TextColored(color_info, f"x = {x_position:+.3f}")
+        
+        psim.Text("Confidence")
+        psim.SameLine()
+        psim.TextColored(color_red if is_collision else color_green, f"{confidence:.4f}")
+        
+        psim.Separator()
+        
+        # Collision status indicator
         if is_collision:
-            ps_moving.set_color([1.0, 0.2, 0.2])  # Red - collision
+            psim.TextColored((1.0, 0.35, 0.35, 1.0), ">> INTERSECTION DETECTED <<")
         else:
-            ps_moving.set_color([0.2, 0.8, 0.2])  # Green - no collision
-        ps_moving.set_radius(0.02)
+            psim.TextColored((0.35, 0.9, 0.35, 1.0), "No Intersection")
+    
+    def _render_confidence_graph(self):
+        """Render the confidence history graph."""
+        psim.TextColored((0.8, 0.8, 0.8, 1.0), "Confidence Curve")
+        
+        if self.confidence_history:
+            psim.PlotLines(
+                "##confidence_plot",
+                self.confidence_history.copy(),
+                graph_size=(400, 140),
+                scale_min=0.0,
+                scale_max=1.0
+            )
+            psim.TextColored((0.6, 0.6, 0.6, 1.0), f"Samples: {len(self.confidence_history)}")
+        else:
+            psim.TextColored((0.5, 0.5, 0.5, 1.0), "Move slider to build curve...")
+        
+        psim.TextColored((0.5, 0.5, 0.5, 1.0), f"Threshold: {COLLISION_THRESHOLD}")
+    
+    def _render_confidence_bar(self, confidence: float):
+        """Render the confidence progress bar."""
+        bar_width = 50
+        filled = int(confidence * bar_width)
+        bar = "█" * filled + "░" * (bar_width - filled)
+        
+        color = (1.0, 0.4, 0.4, 1.0) if confidence > COLLISION_THRESHOLD else (0.4, 0.9, 0.4, 1.0)
+        psim.TextColored(color, f"{bar} {confidence:.1%}")
     
     def create_ui_callback(self):
-        """Create the Polyscope UI callback with slider-controlled confidence graph."""
+        """Create the Polyscope UI callback with slider-controlled visualization."""
         
         def ui_callback():
-            # Get current confidence
             current_conf = self.get_current_confidence()
             current_x = self.x_positions[self.current_step]
             
-            # Title
+            # Header
             psim.TextColored((0.9, 0.9, 0.9, 1.0), "COLLISION DETECTION")
             psim.Separator()
             
-            # Status display
-            psim.Text(f"Step")
-            psim.SameLine()
-            psim.TextColored((0.7, 0.85, 1.0, 1.0), f"{self.current_step + 1} / {self.config.num_positions}")
-            
-            psim.Text(f"Position")
-            psim.SameLine()
-            psim.TextColored((0.7, 0.85, 1.0, 1.0), f"x = {current_x:+.3f}")
-            
-            psim.Text(f"Confidence")
-            psim.SameLine()
-            if current_conf > 0.5:
-                psim.TextColored((1.0, 0.4, 0.4, 1.0), f"{current_conf:.4f}")
-            else:
-                psim.TextColored((0.4, 1.0, 0.4, 1.0), f"{current_conf:.4f}")
-            
+            # Status panel
+            self._render_status_panel(current_conf, current_x)
             psim.Separator()
             
-            # Status indicator - clean and prominent
-            if current_conf > 0.5:
-                psim.TextColored((1.0, 0.35, 0.35, 1.0), ">> INTERSECTION DETECTED <<")
-            else:
-                psim.TextColored((0.35, 0.9, 0.35, 1.0), "No Intersection")
-            
-            psim.Separator()
-            
-            # Step slider - the main control
+            # Step slider control
             changed, new_step = psim.SliderInt(
                 "##step_slider", 
                 self.current_step, 
@@ -349,48 +384,20 @@ class ConfidenceVisualizer:
                 self.update_history_for_step(new_step)
                 self.update_visualization()
             
+            # Reset button
             psim.SameLine()
             if psim.Button("Reset"):
-                self.current_step = 0
-                self.confidence_history = []
-                self.last_recorded_step = -1
+                self.initialize_steps()
                 self.update_visualization()
             
             psim.Separator()
             
-            # Confidence graph section
-            psim.TextColored((0.8, 0.8, 0.8, 1.0), "Confidence Curve")
+            # Confidence graph
+            self._render_confidence_graph()
             
-            if len(self.confidence_history) > 0:
-                graph_values = self.confidence_history.copy()
-                
-                # Plot the confidence curve - larger and cleaner
-                psim.PlotLines(
-                    "##confidence_plot",
-                    graph_values,
-                    graph_size=(400, 140),
-                    scale_min=0.0,
-                    scale_max=1.0
-                )
-                
-                # Graph info
-                psim.TextColored((0.6, 0.6, 0.6, 1.0), f"Samples: {len(self.confidence_history)}")
-            else:
-                psim.TextColored((0.5, 0.5, 0.5, 1.0), "Move slider to build curve...")
-            
-            # Threshold indicator
-            psim.TextColored((0.5, 0.5, 0.5, 1.0), "Threshold: 0.5")
-            
-            # Confidence bar - cleaner visualization
+            # Confidence bar
             psim.Separator()
-            bar_width = 50
-            filled = int(current_conf * bar_width)
-            bar = "█" * filled + "░" * (bar_width - filled)
-            
-            if current_conf > 0.5:
-                psim.TextColored((1.0, 0.4, 0.4, 1.0), f"{bar} {current_conf:.1%}")
-            else:
-                psim.TextColored((0.4, 0.9, 0.4, 1.0), f"{bar} {current_conf:.1%}")
+            self._render_confidence_bar(current_conf)
         
         return ui_callback
     
@@ -414,26 +421,27 @@ class ConfidenceVisualizer:
         ps.set_user_callback(self.create_ui_callback())
         ps.show()
     
+    # =========================================================================
+    # Export
+    # =========================================================================
+    
     def export_confidence_plot(self, output_path: str = "confidence_curve.png", 
                                 figsize: Tuple[float, float] = (12, 4)):
         """Export the confidence curve as a publication-quality matplotlib plot."""
-        # Precompute all confidences for export
         self.precompute_all_confidences()
         
         fig, ax = plt.subplots(figsize=figsize)
-        
-        # Convert to numpy array for plotting
         conf_array = np.array(self.confidence_history)
         
-        # Plot confidence curve with color based on threshold
+        # Plot curve segments colored by collision state
         for i in range(len(self.x_positions) - 1):
             x = [self.x_positions[i], self.x_positions[i + 1]]
             y = [conf_array[i], conf_array[i + 1]]
-            color = 'red' if conf_array[i] > 0.5 else 'green'
+            color = 'red' if conf_array[i] > COLLISION_THRESHOLD else 'green'
             ax.plot(x, y, color=color, linewidth=2)
         
-        # Fill regions
-        above_threshold = conf_array > 0.5
+        # Fill regions based on threshold
+        above_threshold = conf_array > COLLISION_THRESHOLD
         ax.fill_between(self.x_positions, 0, conf_array, 
                         where=above_threshold, alpha=0.3, color='red', 
                         label='Collision detected')
@@ -442,8 +450,8 @@ class ConfidenceVisualizer:
                         label='No collision')
         
         # Threshold line
-        ax.axhline(y=0.5, color='gray', linestyle='--', linewidth=1.5, 
-                   label='Decision threshold (0.5)')
+        ax.axhline(y=COLLISION_THRESHOLD, color='gray', linestyle='--', linewidth=1.5, 
+                   label=f'Decision threshold ({COLLISION_THRESHOLD})')
         
         # Labels and styling
         ax.set_xlabel('X Position (tetrahedron offset)', fontsize=12)
