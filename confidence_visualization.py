@@ -1,9 +1,8 @@
-"""
-Tetrahedron Collision Confidence Visualization
 
-Visualizes neural network collision detection confidence as one tetrahedron 
-moves through another. Demonstrates the model's discrimination quality.
-"""
+# Tetrahedron Collision Confidence Visualization
+#
+# Visualizes neural network collision detection confidence as one tetrahedron moves through another.
+# Useful for understanding model discrimination and failure cases.
 
 import numpy as np
 import torch
@@ -18,12 +17,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Constants
-# =============================================================================
 
-COLLISION_THRESHOLD = 0.5
-WIREFRAME_RADIUS = 0.02
+# ==============================================================================
+# Constants & Appearance
+# ==============================================================================
+
+COLLISION_THRESHOLD = 0.50
+WIREFRAME_RADIUS = 0.004
 
 COLOR_STATIONARY = (0.2, 0.5, 0.9)
 COLOR_COLLISION = (1.0, 0.2, 0.2)
@@ -32,9 +32,10 @@ COLOR_NO_COLLISION = (0.2, 0.8, 0.2)
 TETRAHEDRON_EDGES = np.array([(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)])
 
 
-# =============================================================================
-# Configuration
-# =============================================================================
+
+# ==============================================================================
+# Visualization Configuration
+# ==============================================================================
 
 @dataclass
 class VisualizationConfig:
@@ -44,40 +45,61 @@ class VisualizationConfig:
     plot_width: int = 800
 
 
-# =============================================================================
+
+# ==============================================================================
 # Model Preprocessing
-# =============================================================================
+# ==============================================================================
 
 class Preprocessing:
-    """Aligns tetrahedra to principal axes before model inference."""
+    # Preprocessing utilities for model input
     
     @staticmethod
     def principal_axis_transform(input_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Aligns both tetrahedra to the principal axes of the first.
+        Returns a (batch, 24) tensor with both transformed tets.
+        """
         data = input_tensor.to(torch.float64)
         batch_size = data.size(0)
-        
         tetra1 = data[:, :12].view(batch_size, 4, 3)
         tetra2 = data[:, 12:].view(batch_size, 4, 3)
-        
         centroid1 = torch.mean(tetra1, dim=1, keepdim=True)
         tetra1_centered = tetra1 - centroid1
         tetra2_centered = tetra2 - centroid1
-        
         cov_matrix = torch.bmm(tetra1_centered.transpose(1, 2), tetra1_centered)
         _, eigenvectors = torch.linalg.eigh(cov_matrix)
-        
         tetra1_transformed = torch.bmm(tetra1_centered, eigenvectors)
         tetra2_transformed = torch.bmm(tetra2_centered, eigenvectors)
-        
         return torch.cat([
             tetra1_transformed.view(batch_size, 12),
             tetra2_transformed.view(batch_size, 12)
         ], dim=1).to(torch.float64)
 
+    @staticmethod
+    def unitary_transform(input_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Applies a unitary transformation to the second tetrahedron,
+        mapping the first to a canonical frame. Handles 24->12 dimension change.
+        Returns (batch, 12) tensor for the transformed second tet.
+        """
+        data = input_tensor.to(torch.float64)
+        batch_size = data.size(0)
+        tetra1 = data[:, :12].view(batch_size, 4, 3)
+        tetra2 = data[:, 12:].view(batch_size, 4, 3)
+        v0 = tetra1[:, 0:1, :]
+        edge_vectors = tetra1[:, 1:, :] - v0
+        translated_tetra2 = tetra2 - v0
+        try:
+            inv_transform = torch.linalg.inv(edge_vectors)
+            transformed_tetra2 = torch.bmm(translated_tetra2, inv_transform)
+        except Exception:
+            transformed_tetra2 = translated_tetra2
+        return transformed_tetra2.view(batch_size, 12).to(torch.float64)
 
-# =============================================================================
+
+# ==============================================================================
 # Tetrahedron I/O
-# =============================================================================
+# ==============================================================================
 
 def load_tetrahedron_from_obj(filepath: str) -> np.ndarray:
     """Load tetrahedron vertices from OBJ file. Returns (4, 3) array."""
@@ -105,9 +127,10 @@ def create_default_tetrahedron() -> np.ndarray:
     ], dtype=np.float64)
 
 
-# =============================================================================
+
+# ==============================================================================
 # Main Visualizer
-# =============================================================================
+# ==============================================================================
 
 class ConfidenceVisualizer:
     
@@ -115,10 +138,10 @@ class ConfidenceVisualizer:
         self.config = config or VisualizationConfig()
         self.model: Optional[torch.nn.Module] = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+        # Geometry
         self.tet_stationary: Optional[np.ndarray] = None
         self.tet_moving_base: Optional[np.ndarray] = None
-        
+        # Simulation state
         self.x_positions: np.ndarray = np.array([])
         self.current_step: int = 0
         self.confidence_history: List[float] = []
@@ -128,6 +151,7 @@ class ConfidenceVisualizer:
     # -------------------------------------------------------------------------
     
     def load_model(self, model_path: str) -> bool:
+        """Load a PyTorch model from file."""
         try:
             self.model = torch.load(model_path, map_location=self.device, weights_only=False)
             self.model.double()
@@ -138,8 +162,8 @@ class ConfidenceVisualizer:
             logger.error(f"Failed to load model: {e}")
             return False
     
-    def load_tetrahedra(self, stationary_path: Optional[str] = None, 
-                        moving_path: Optional[str] = None) -> bool:
+    def load_tetrahedra(self, stationary_path: Optional[str] = None, moving_path: Optional[str] = None) -> bool:
+        """Load stationary and moving tetrahedra from OBJ files or use defaults."""
         try:
             if stationary_path:
                 self.tet_stationary = load_tetrahedron_from_obj(stationary_path)
@@ -147,23 +171,22 @@ class ConfidenceVisualizer:
             else:
                 self.tet_stationary = create_default_tetrahedron()
                 logger.info("Using default stationary tetrahedron")
-            
             if moving_path:
                 self.tet_moving_base = load_tetrahedron_from_obj(moving_path)
                 logger.info(f"Loaded moving tetrahedron from {moving_path}")
             else:
                 self.tet_moving_base = create_default_tetrahedron()
                 logger.info("Using default moving tetrahedron")
-            
+            # Center both at origin
             self.tet_stationary -= self.tet_stationary.mean(axis=0)
             self.tet_moving_base -= self.tet_moving_base.mean(axis=0)
-            
             return True
         except Exception as e:
             logger.error(f"Failed to load tetrahedra: {e}")
             return False
     
     def initialize_steps(self):
+        """Initialize the x positions and reset simulation state."""
         x_min, x_max = self.config.x_range
         self.x_positions = np.linspace(x_min, x_max, self.config.num_positions)
         self.confidence_history = []
@@ -175,36 +198,37 @@ class ConfidenceVisualizer:
     # -------------------------------------------------------------------------
     
     def _normalize_to_unit_cube(self, tet1: np.ndarray, tet2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Scale both tetrahedra uniformly to fit within unit cube."""
+        """Uniformly scale both tetrahedra to fit within a unit cube."""
         combined = np.concatenate([tet1, tet2], axis=0)
         min_vals = combined.min(axis=0)
         max_range = (combined.max(axis=0) - min_vals).max() or 1.0
-        
         return (tet1 - min_vals) / max_range, (tet2 - min_vals) / max_range
     
     def _get_moved_tetrahedron(self, step: int) -> np.ndarray:
+        """Return the moving tetrahedron translated to the current x position."""
         tet_moved = self.tet_moving_base.copy()
         tet_moved[:, 0] += self.x_positions[step]
         return tet_moved
     
     def compute_confidence(self, tet1: np.ndarray, tet2: np.ndarray) -> float:
-        """Run model inference on a tetrahedron pair."""
+        """
+        Run model inference on a tetrahedron pair.
+        Returns the confidence value (float).
+        """
         if self.model is None:
             return 0.0
-        
         tet1_norm, tet2_norm = self._normalize_to_unit_cube(tet1, tet2)
         data = np.concatenate([tet1_norm.flatten(), tet2_norm.flatten()])
         tensor = torch.tensor(data, dtype=torch.float64).unsqueeze(0).to(self.device)
-        
         with torch.no_grad():
             transformed = Preprocessing.principal_axis_transform(tensor)
+            transformed = Preprocessing.unitary_transform(transformed)
             output = self.model(transformed)
             confidence = torch.sigmoid(output).cpu().numpy().flatten()[0]
-        
         return float(confidence)
     
     def compute_and_record_confidence(self) -> float:
-        """Compute confidence for current step and append to history."""
+        """Compute and record confidence for the current step."""
         tet_moved = self._get_moved_tetrahedron(self.current_step)
         conf = self.compute_confidence(self.tet_stationary, tet_moved)
         self.confidence_history.append(conf)
@@ -215,26 +239,24 @@ class ConfidenceVisualizer:
     # -------------------------------------------------------------------------
     
     def initialize_polyscope(self):
+        """Initialize Polyscope and register tetrahedra for visualization."""
         ps.init()
         ps.set_up_dir("y_up")
         ps.set_ground_plane_mode("none")
-        
         ps_stationary = ps.register_curve_network(
             "Stationary Tetrahedron", self.tet_stationary, TETRAHEDRON_EDGES)
         ps_stationary.set_color(COLOR_STATIONARY)
         ps_stationary.set_radius(WIREFRAME_RADIUS)
-        
         ps_moving = ps.register_curve_network(
             "Moving Tetrahedron", self._get_moved_tetrahedron(self.current_step), TETRAHEDRON_EDGES)
         ps_moving.set_color(COLOR_NO_COLLISION)
         ps_moving.set_radius(WIREFRAME_RADIUS)
-        
         logger.info("Polyscope visualization initialized")
     
     def update_visualization(self, confidence: float):
+        """Update the color of the moving tetrahedron based on collision confidence."""
         is_collision = confidence > COLLISION_THRESHOLD
         color = COLOR_COLLISION if is_collision else COLOR_NO_COLLISION
-        
         ps_moving = ps.register_curve_network(
             "Moving Tetrahedron", self._get_moved_tetrahedron(self.current_step), TETRAHEDRON_EDGES)
         ps_moving.set_color(color)
@@ -245,34 +267,29 @@ class ConfidenceVisualizer:
     # -------------------------------------------------------------------------
     
     def _render_status_panel(self, confidence: float, x_position: float):
+        """Show current step, position, and confidence, with collision status."""
         is_collision = confidence > COLLISION_THRESHOLD
-        
         color_red = (1.0, 0.4, 0.4, 1.0)
         color_green = (0.4, 1.0, 0.4, 1.0)
         color_info = (0.7, 0.85, 1.0, 1.0)
-        
         psim.Text("Step")
         psim.SameLine()
         psim.TextColored(color_info, f"{self.current_step + 1} / {self.config.num_positions}")
-        
         psim.Text("Position")
         psim.SameLine()
         psim.TextColored(color_info, f"x = {x_position:+.3f}")
-        
         psim.Text("Confidence")
         psim.SameLine()
         psim.TextColored(color_red if is_collision else color_green, f"{confidence:.4f}")
-        
         psim.Separator()
-        
         if is_collision:
             psim.TextColored((1.0, 0.35, 0.35, 1.0), ">> INTERSECTION DETECTED <<")
         else:
             psim.TextColored((0.35, 0.9, 0.35, 1.0), "No Intersection")
     
     def _render_confidence_graph(self):
+        """Plot the confidence curve for all steps so far."""
         psim.TextColored((0.8, 0.8, 0.8, 1.0), "Confidence Curve")
-        
         if self.confidence_history:
             psim.PlotLines(
                 "##confidence_plot",
@@ -284,54 +301,66 @@ class ConfidenceVisualizer:
             psim.TextColored((0.6, 0.6, 0.6, 1.0), f"Inferences: {len(self.confidence_history)}")
         else:
             psim.TextColored((0.5, 0.5, 0.5, 1.0), "Move slider to build curve...")
-        
         psim.TextColored((0.5, 0.5, 0.5, 1.0), f"Threshold: {COLLISION_THRESHOLD}")
     
     def _render_confidence_bar(self, confidence: float):
+        """Show a simple bar visualization of the current confidence."""
         bar_width = 50
         filled = int(confidence * bar_width)
         bar = "█" * filled + "░" * (bar_width - filled)
-        
         color = (1.0, 0.4, 0.4, 1.0) if confidence > COLLISION_THRESHOLD else (0.4, 0.9, 0.4, 1.0)
         psim.TextColored(color, f"{bar} {confidence:.1%}")
     
     def create_ui_callback(self):
+        """Create the Polyscope UI callback for interactive controls."""
         def ui_callback():
+            step_changed = False
+            # Keyboard navigation: left/right arrow keys using psim
+            if psim.IsKeyPressed(psim.ImGuiKey_LeftArrow):
+                if self.current_step > 0:
+                    self.current_step -= 1
+                    step_changed = True
+            if psim.IsKeyPressed(psim.ImGuiKey_RightArrow):
+                if self.current_step < self.config.num_positions - 1:
+                    self.current_step += 1
+                    step_changed = True
+            # UI slider for step
             changed, new_step = psim.SliderInt(
                 "##step_slider", self.current_step, 0, self.config.num_positions - 1)
-            
             if changed and new_step != self.current_step:
                 self.current_step = new_step
-            
-            current_conf = self.compute_and_record_confidence()
+                step_changed = True
+            # UI slider for number of positions (step size)
+            psim.Separator()
+            psim.Text("Step granularity (positions):")
+            changed_n, new_n = psim.SliderInt("##num_positions", self.config.num_positions, 10, 5000)
+            if changed_n and new_n != self.config.num_positions:
+                self.config.num_positions = new_n
+                self.initialize_steps()
+                self.current_step = min(self.current_step, self.config.num_positions - 1)
+                step_changed = True
+            current_conf = self.compute_and_record_confidence() if step_changed else (self.confidence_history[-1] if self.confidence_history else self.compute_and_record_confidence())
             current_x = self.x_positions[self.current_step]
-            
             self.update_visualization(current_conf)
-            
             psim.TextColored((0.9, 0.9, 0.9, 1.0), "COLLISION DETECTION")
             psim.Separator()
-            
             self._render_status_panel(current_conf, current_x)
             psim.Separator()
-            
             if psim.Button("Reset"):
                 self.initialize_steps()
-            
             psim.Separator()
             self._render_confidence_graph()
             psim.Separator()
             self._render_confidence_bar(current_conf)
-        
         return ui_callback
     
     def run(self):
+        """Run the interactive visualization."""
         if self.tet_stationary is None or self.tet_moving_base is None:
             logger.error("Tetrahedra not loaded")
             return
-        
         if self.model is None:
             logger.warning("No model loaded - confidence values will be 0")
-        
         self.initialize_steps()
         self.initialize_polyscope()
         ps.set_user_callback(self.create_ui_callback())
@@ -413,7 +442,7 @@ def main():
                         help="Stationary tetrahedron OBJ file")
     parser.add_argument("--moving", "-m", type=str, default=None,
                         help="Moving tetrahedron OBJ file")
-    parser.add_argument("--model", "-M", type=str, default="model/EuroGraphicsPaper.pt",
+    parser.add_argument("--model", "-M", type=str, default="model/EuroGraphicsDemo_PCA_Unit.pt",
                         help="PyTorch model file")
     parser.add_argument("--positions", "-n", type=int, default=100,
                         help="Number of positions along trajectory")
