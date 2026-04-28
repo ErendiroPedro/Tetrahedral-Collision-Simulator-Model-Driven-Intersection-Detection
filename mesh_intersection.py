@@ -36,12 +36,16 @@ class SimulationConfig:
     default_color_b: List[float] = None
     collision_color: List[float] = None
     batch_size: int = 2048  # Adjusted for memory efficiency
+    rotate_static: bool = False
+    rotation_speed: float = np.pi / 180 * 2  # radians per step
+    rotation_axis: np.ndarray = None
 
     def __post_init__(self):
         if self.initial_offset is None: self.initial_offset = np.array([3.0, 0.0, 0.0])
         if self.default_color_a is None: self.default_color_a = [0.3, 0.3, 1.0]  # Blue
         if self.default_color_b is None: self.default_color_b = [0.3, 1.0, 0.3]  # Green
         if self.collision_color is None: self.collision_color = [1.0, 0.0, 0.0]  # Red
+        if self.rotation_axis is None: self.rotation_axis = np.array([0.0, 1.0, 0.0])
 
 @dataclass
 class TetrahedralMesh:
@@ -79,7 +83,16 @@ class TetrahedralGenerator:
         try:
             import tetgen
             tet = tetgen.TetGen(mesh.vertices, mesh.faces)
-            vertices, tetrahedra = tet.tetrahedralize(order=1, mindihedral=20, minratio=1.5, quality=True)
+            result = tet.tetrahedralize(order=1, mindihedral=20, minratio=1.5, quality=True)
+            if isinstance(result, tuple):
+                if len(result) == 2:
+                    vertices, tetrahedra = result
+                elif len(result) >= 3:
+                    vertices, tetrahedra = result[0], result[1]
+                else:
+                    raise ValueError("Unexpected TetGen return shape")
+            else:
+                vertices, tetrahedra = result
             logger.info(f"Generated {len(tetrahedra)} tetrahedra from {len(vertices)} vertices")
             return vertices, tetrahedra
         except Exception as e:
@@ -146,6 +159,7 @@ class TetrahedralCollisionSimulator:
         self.visualization_manager = VisualizationManager(self.config)
         self.mesh_a: Optional[TetrahedralMesh] = None
         self.mesh_b: Optional[TetrahedralMesh] = None
+        self.mesh_a_original_vertices: Optional[np.ndarray] = None
         self.current_step = 0
         self.step_size: Optional[np.ndarray] = None
         self.collision_pairs: List[Tuple[int, int]] = []
@@ -172,6 +186,7 @@ class TetrahedralCollisionSimulator:
         self.mesh_a = self.load_mesh(mesh_a_path)
         self.mesh_b = self.load_mesh(mesh_b_path, apply_offset=True)
         if not (self.mesh_a and self.mesh_b): return False
+        self.mesh_a_original_vertices = self.mesh_a.vertices.copy()
         self.step_size = -self.config.initial_offset / self.config.num_steps
         logger.info("Successfully loaded and prepared meshes.")
         return True
@@ -264,6 +279,18 @@ class TetrahedralCollisionSimulator:
 
         self.narrow_phase()
 
+    def rotate_static_mesh(self):
+        if not self.mesh_a or not self.config.rotate_static:
+            return
+
+        center = np.mean(self.mesh_a.vertices, axis=0)
+        angle = self.config.rotation_speed
+        axis = self.config.rotation_axis
+        transform = trimesh.transformations.rotation_matrix(angle, axis, point=center)
+        self.mesh_a.vertices = trimesh.transform_points(self.mesh_a.vertices, transform)
+        self.mesh_a.aabbs = TetrahedralGenerator.calculate_aabbs(self.mesh_a.vertices, self.mesh_a.tetrahedra)
+        self.visualization_manager.update_mesh_positions("Mesh A", self.mesh_a.vertices)
+
     def step_forward(self):
         if self.current_step >= self.config.num_steps:
             self.is_playing = False # Stop playing at the end
@@ -273,6 +300,9 @@ class TetrahedralCollisionSimulator:
         self.mesh_b.vertices += self.step_size
         self.mesh_b.aabbs = TetrahedralGenerator.calculate_aabbs(self.mesh_b.vertices, self.mesh_b.tetrahedra)
         self.visualization_manager.update_mesh_positions("Mesh B", self.mesh_b.vertices)
+
+        if self.config.rotate_static:
+            self.rotate_static_mesh()
         
         self.detect_collisions()
         self.visualization_manager.update_collision_colors("Mesh A", self.mesh_a, "Mesh B", self.mesh_b, self.collision_pairs)
@@ -285,6 +315,11 @@ class TetrahedralCollisionSimulator:
         self.mesh_b.vertices -= self.step_size * self.current_step
         self.mesh_b.aabbs = TetrahedralGenerator.calculate_aabbs(self.mesh_b.vertices, self.mesh_b.tetrahedra)
         self.visualization_manager.update_mesh_positions("Mesh B", self.mesh_b.vertices)
+
+        if self.mesh_a_original_vertices is not None:
+            self.mesh_a.vertices = self.mesh_a_original_vertices.copy()
+            self.mesh_a.aabbs = TetrahedralGenerator.calculate_aabbs(self.mesh_a.vertices, self.mesh_a.tetrahedra)
+            self.visualization_manager.update_mesh_positions("Mesh A", self.mesh_a.vertices)
         
         self.current_step = 0
         self.collision_pairs = []
@@ -328,11 +363,14 @@ class TetrahedralCollisionSimulator:
 
 
 def main():
-    config = SimulationConfig(num_steps=50, initial_offset=np.array([2.5, 0.0, 0.0]))
+    config = SimulationConfig(num_steps=50, initial_offset=np.array([2.5, 0.0, 0.0]), rotate_static=True, rotation_speed=np.pi / 180 * 10)
     simulator = TetrahedralCollisionSimulator(config)
     try:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = torch.load('model/TetrahedronPairNet_L_principal_axis.pt', map_location=device)
+        try:
+            model = torch.load('model/TetrahedronPairNet_L_principal_axis.pt', map_location=device, weights_only=False)
+        except TypeError:
+            model = torch.load('model/TetrahedronPairNet_L_principal_axis.pt', map_location=device)
         model.double()
         simulator.set_collision_model(model)
     except FileNotFoundError:
@@ -340,7 +378,7 @@ def main():
     except Exception as e:
         logger.error(f"Failed to load PyTorch model: {e}")
 
-    if not simulator.load_meshes("data/armadillo.obj", "data/armadillo.obj"):
+    if not simulator.load_meshes("data/spot.obj", "data/spot.obj"):
         return
     
     simulator.initialize_visualization()

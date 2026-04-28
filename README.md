@@ -40,27 +40,28 @@ python -m pip install -r requirements.txt
 
 ## Run the main collision simulator
 
-This launches the tetrahedral collision visualization using the default model and sample mesh data.
+This script runs the basic tetrahedral collision simulation and opens an interactive `polyscope` viewer.
 
 ```bash
 python3 mesh_intersection.py
 ```
 
-If the model file is missing, place it at:
+It uses the default model and sample mesh data:
 
-- `model/TetrahedronPairNet_L_principal_axis.pt`
+- model: `model/TetrahedronPairNet_L_principal_axis.pt`
+- geometry: `data/spot.obj`
 
-The script loads sample meshes from:
-
-- `data/armadillo.obj`
+In `mesh_intersection.py`, the simulation is configured with `SimulationConfig`. To make the static mesh rotate while the other mesh moves, set `rotate_static=True` in the configuration.
 
 ## Run the confidence visualization
 
-Use this script to visualize how the neural model predicts collision confidence as one tetrahedron moves through another.
+This script loads a PyTorch collision model and evaluates one tetrahedron moving along a trajectory past another.
 
 ```bash
 python3 confidence_visualization.py
 ```
+
+It can also export a confidence curve plot without launching the interactive viewer.
 
 Optional arguments:
 
@@ -68,7 +69,7 @@ Optional arguments:
 - `-s`, `--stationary` : stationary tetrahedron OBJ file
 - `-m`, `--moving` : moving tetrahedron OBJ file
 - `-e`, `--export` : export the confidence plot to a file
-- `--export-and-show` : export and then show the interactive visualization
+- `--export-and-show` : export the plot and show the interactive visualization
 
 Example:
 
