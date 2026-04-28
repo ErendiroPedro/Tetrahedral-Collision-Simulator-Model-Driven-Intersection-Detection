@@ -9,6 +9,7 @@ This version implements a two-stage detection pipeline:
 3. Visualization: Renders full tetrahedral volumes to highlight colliding cells.
 """
 
+import argparse
 import trimesh
 import trimesh.util
 import polyscope as ps
@@ -363,24 +364,54 @@ class TetrahedralCollisionSimulator:
 
 
 def main():
-    config = SimulationConfig(num_steps=50, initial_offset=np.array([2.5, 0.0, 0.0]), rotate_static=True, rotation_speed=np.pi / 180 * 10)
+    parser = argparse.ArgumentParser(description="Run the tetrahedral collision simulator")
+    parser.add_argument("--model", "-M", type=str, default="model/TetrahedronPairNet_L_principal_axis.pt",
+                        help="Path to the PyTorch collision model")
+    parser.add_argument("--mesh-a", type=str, default="data/spot.obj",
+                        help="Path to the first (static) mesh OBJ file")
+    parser.add_argument("--mesh-b", type=str, default=None,
+                        help="Path to the second (moving) mesh OBJ file; defaults to the same file as --mesh-a")
+    parser.add_argument("--num-steps", type=int, default=50,
+                        help="Number of simulation steps")
+    parser.add_argument("--offset-x", type=float, default=2.5,
+                        help="Initial x offset for the moving mesh")
+    parser.add_argument("--rotate-static", action="store_true",
+                        help="Rotate the static mesh while the second mesh moves")
+    parser.add_argument("--rotation-speed", type=float, default=np.pi / 180 * 10,
+                        help="Static mesh rotation speed in radians per step")
+    parser.add_argument("--rotation-axis", type=float, nargs=3, default=[0.0, 1.0, 0.0],
+                        help="Rotation axis for the static mesh")
+    parser.add_argument("--cpu", action="store_true",
+                        help="Force CPU execution even if CUDA is available")
+
+    args = parser.parse_args()
+    mesh_b_path = args.mesh_b if args.mesh_b is not None else args.mesh_a
+
+    config = SimulationConfig(
+        num_steps=args.num_steps,
+        initial_offset=np.array([args.offset_x, 0.0, 0.0]),
+        rotate_static=args.rotate_static,
+        rotation_speed=args.rotation_speed,
+        rotation_axis=np.array(args.rotation_axis)
+    )
+
     simulator = TetrahedralCollisionSimulator(config)
     try:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu"))
         try:
-            model = torch.load('model/TetrahedronPairNet_L_principal_axis.pt', map_location=device, weights_only=False)
+            model = torch.load(args.model, map_location=device, weights_only=False)
         except TypeError:
-            model = torch.load('model/TetrahedronPairNet_L_principal_axis.pt', map_location=device)
+            model = torch.load(args.model, map_location=device)
         model.double()
         simulator.set_collision_model(model)
     except FileNotFoundError:
-        logger.error("Model file not found. Place it at 'model/TetrahedronPairNet_L_principal_axis.pt'")
+        logger.error(f"Model file not found. Place it at '{args.model}'")
     except Exception as e:
         logger.error(f"Failed to load PyTorch model: {e}")
 
-    if not simulator.load_meshes("data/spot.obj", "data/spot.obj"):
+    if not simulator.load_meshes(args.mesh_a, mesh_b_path):
         return
-    
+
     simulator.initialize_visualization()
     ps.set_user_callback(simulator.create_ui_callback())
     ps.show()

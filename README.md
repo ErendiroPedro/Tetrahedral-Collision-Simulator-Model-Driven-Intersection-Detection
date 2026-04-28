@@ -51,7 +51,25 @@ It uses the default model and sample mesh data:
 - model: `model/TetrahedronPairNet_L_principal_axis.pt`
 - geometry: `data/spot.obj`
 
-In `mesh_intersection.py`, the simulation is configured with `SimulationConfig`. To make the static mesh rotate while the other mesh moves, set `rotate_static=True` in the configuration.
+`mesh_intersection.py` also accepts command-line arguments so you can control the simulation without editing the script.
+
+Common options:
+
+- `--model`, `-M` : path to the PyTorch collision model
+- `--mesh-a` : path to the first (static) OBJ mesh
+- `--mesh-b` : path to the second (moving) OBJ mesh (defaults to the same file as `--mesh-a`)
+- `--num-steps` : number of simulation steps
+- `--offset-x` : initial x offset for the moving mesh
+- `--rotate-static` : rotate the static mesh while the other mesh moves
+- `--rotation-speed` : static mesh rotation speed in radians per step
+- `--rotation-axis` : rotation axis for the static mesh, as three floats
+- `--cpu` : force CPU execution even if CUDA is available
+
+Example:
+
+```bash
+python3 mesh_intersection.py --mesh-a data/spot.obj --mesh-b data/spot.obj --rotate-static --num-steps 80
+```
 
 ## Run the confidence visualization
 
