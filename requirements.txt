@@ -5,3 +5,4 @@ torch>=2.2.0
 Pillow
 tetgen
 rtree
+matplotlib

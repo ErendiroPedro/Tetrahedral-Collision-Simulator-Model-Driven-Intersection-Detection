@@ -266,6 +266,12 @@ class ConfidenceVisualizer:
     # UI Components
     # -------------------------------------------------------------------------
     
+    def _prepare_plot_values(self) -> np.ndarray:
+        """Return confidence history in the NumPy format expected by Polyscope."""
+        values = np.asarray(self.confidence_history, dtype=np.float32)
+        values.setflags(write=False)
+        return values
+
     def _render_status_panel(self, confidence: float, x_position: float):
         """Show current step, position, and confidence, with collision status."""
         is_collision = confidence > COLLISION_THRESHOLD
@@ -291,9 +297,10 @@ class ConfidenceVisualizer:
         """Plot the confidence curve for all steps so far."""
         psim.TextColored((0.8, 0.8, 0.8, 1.0), "Confidence Curve")
         if self.confidence_history:
+            plot_values = self._prepare_plot_values()
             psim.PlotLines(
                 "##confidence_plot",
-                self.confidence_history.copy(),
+                plot_values,
                 graph_size=(400, 140),
                 scale_min=0.0,
                 scale_max=1.0
@@ -442,7 +449,7 @@ def main():
                         help="Stationary tetrahedron OBJ file")
     parser.add_argument("--moving", "-m", type=str, default=None,
                         help="Moving tetrahedron OBJ file")
-    parser.add_argument("--model", "-M", type=str, default="model/EuroGraphicsDemo_PCA_Unit.pt",
+    parser.add_argument("--model", "-M", type=str, default="model/TetrahedronPairNet_PCA_Unit.pt",
                         help="PyTorch model file")
     parser.add_argument("--positions", "-n", type=int, default=100,
                         help="Number of positions along trajectory")

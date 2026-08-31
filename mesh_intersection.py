@@ -1,418 +1,542 @@
 """
 Tetrahedral Collision Simulator
 
-A modular simulation system for detecting collisions between tetrahedral meshes
-using PyTorch models for narrow-phase collision detection.
-This version implements a two-stage detection pipeline:
-1. Broad Phase: A highly efficient R-tree implementation using trimesh.util.bounds_tree.
-2. Narrow Phase: Vectorized data gathering and precise model-based checking with timing.
-3. Visualization: Renders full tetrahedral volumes to highlight colliding cells.
+Detects collisions between two tetrahedral meshes with a two-stage pipeline:
+1. Broad phase: R-tree over per-tetrahedron AABBs (``trimesh.util.bounds_tree``).
+2. Narrow phase: batched TorchScript inference over a configurable transform chain.
+3. Visualization: polyscope volume meshes with colliding cells highlighted.
+
+Transforms are registered in ``TRANSFORMS`` and selected with ``--transform``; each
+bundled model declares its expected chain in ``MODEL_TRANSFORMS``.
 """
 
+from __future__ import annotations
+
 import argparse
-import trimesh
-import trimesh.util
+import contextlib
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from operator import attrgetter
+from pathlib import Path
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+
+import numpy as np
 import polyscope as ps
 import polyscope.imgui as psim
-import numpy as np
 import torch
-from typing import Optional, Tuple, List
-from dataclasses import dataclass
-import logging
-import time
-import threading
-import concurrent.futures
+import trimesh
+import trimesh.util
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+
+
+class _CompactFormatter(logging.Formatter):
+    """Drops the level prefix on INFO so per-step progress lines stay scannable."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = record.getMessage()
+        return message if record.levelno == logging.INFO else f"{record.levelname}: {message}"
+
+
+def configure_logging(level_name: str) -> None:
+    level = getattr(logging, level_name)
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)-7s %(message)s")
+        if level <= logging.DEBUG
+        else _CompactFormatter()
+    )
+    logging.basicConfig(level=level, handlers=[handler], force=True)
+
+
+@contextlib.contextmanager
+def quiet_native_stdout(enabled: bool = True) -> Iterator[None]:
+    """Silence writes to fd 1; polyscope prints its backend banner there, bypassing Python."""
+    if not enabled:
+        yield
+        return
+    saved, null = os.dup(1), os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(null, 1)
+        yield
+    finally:
+        os.dup2(saved, 1)
+        os.close(null)
+        os.close(saved)
+
+
+# --------------------------------------------------------------------------- #
+# Model input transforms
+# --------------------------------------------------------------------------- #
+
+Transform = Callable[[torch.Tensor], torch.Tensor]
+
+
+def _split_pair(data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Split a flat (batch, 24) pair encoding into two (batch, 4, 3) tetrahedra."""
+    pair = data.to(torch.float64).reshape(-1, 8, 3)
+    return pair[:, :4], pair[:, 4:]
+
+
+def principal_axis(data: torch.Tensor) -> torch.Tensor:
+    """Re-express both tetrahedra in the principal-axis frame of the first. -> (batch, 24)"""
+    tetra1, tetra2 = _split_pair(data)
+    centroid = tetra1.mean(dim=1, keepdim=True)
+    tetra1, tetra2 = tetra1 - centroid, tetra2 - centroid
+    _, axes = torch.linalg.eigh(torch.bmm(tetra1.transpose(1, 2), tetra1))
+    return torch.cat([torch.bmm(tetra1, axes), torch.bmm(tetra2, axes)], dim=1).flatten(1)
+
+
+def unit_frame(data: torch.Tensor) -> torch.Tensor:
+    """Map the first tetrahedron to the unit simplex, keeping only the second. -> (batch, 12)"""
+    tetra1, tetra2 = _split_pair(data)
+    origin = tetra1[:, :1]
+    edges = tetra1[:, 1:] - origin
+    relative = tetra2 - origin
+    try:
+        relative = torch.linalg.solve(edges.transpose(1, 2), relative.transpose(1, 2)).transpose(1, 2)
+    except torch.linalg.LinAlgError:  # degenerate tetrahedron: keep the translated coordinates
+        pass
+    return relative.flatten(1)
+
+
+TRANSFORMS: Dict[str, Transform] = {
+    "pca": principal_axis,
+    "unit": unit_frame,
+}
+
+# Chain each bundled model was trained with, keyed by model file stem.
+MODEL_TRANSFORMS: Dict[str, Tuple[str, ...]] = {
+    "EuroGraphicsPaper_PCA": ("pca",),
+    "EuroGraphicsDemo_PCA_Unit": ("pca", "unit"),
+}
+DEFAULT_TRANSFORMS: Tuple[str, ...] = ("pca",)
+
+
+def transforms_for_model(model_path: str) -> Tuple[str, ...]:
+    return MODEL_TRANSFORMS.get(Path(model_path).stem, DEFAULT_TRANSFORMS)
+
+
+def build_pipeline(names: Sequence[str]) -> Transform:
+    unknown = sorted(set(names) - set(TRANSFORMS))
+    if unknown:
+        raise ValueError(f"Unknown transform(s) {unknown}; available: {sorted(TRANSFORMS)}")
+    steps = [TRANSFORMS[name] for name in names]
+
+    def pipeline(data: torch.Tensor) -> torch.Tensor:
+        for step in steps:
+            data = step(data)
+        return data
+
+    return pipeline
+
+
+# --------------------------------------------------------------------------- #
+# Geometry
+# --------------------------------------------------------------------------- #
 
 
 @dataclass
 class SimulationConfig:
     """Configuration parameters for the simulation."""
     num_steps: int = 50
-    initial_offset: np.ndarray = None
-    default_color_a: List[float] = None
-    default_color_b: List[float] = None
-    collision_color: List[float] = None
-    batch_size: int = 2048  # Adjusted for memory efficiency
+    batch_size: int = 2048
+    initial_offset: np.ndarray = field(default_factory=lambda: np.array([3.0, 0.0, 0.0]))
     rotate_static: bool = False
-    rotation_speed: float = np.pi / 180 * 2  # radians per step
-    rotation_axis: np.ndarray = None
+    rotation_speed: float = np.radians(2.0)  # radians per step
+    rotation_axis: np.ndarray = field(default_factory=lambda: np.array([0.0, 1.0, 0.0]))
+    collision_color: List[float] = field(default_factory=lambda: [1.0, 0.0, 0.0])
 
-    def __post_init__(self):
-        if self.initial_offset is None: self.initial_offset = np.array([3.0, 0.0, 0.0])
-        if self.default_color_a is None: self.default_color_a = [0.3, 0.3, 1.0]  # Blue
-        if self.default_color_b is None: self.default_color_b = [0.3, 1.0, 0.3]  # Green
-        if self.collision_color is None: self.collision_color = [1.0, 0.0, 0.0]  # Red
-        if self.rotation_axis is None: self.rotation_axis = np.array([0.0, 1.0, 0.0])
 
 @dataclass
 class TetrahedralMesh:
-    """Container for tetrahedral mesh data."""
+    """A tetrahedralized mesh and the per-tetrahedron AABBs used by the broad phase."""
+    name: str
+    color: List[float]
     vertices: np.ndarray
     tetrahedra: np.ndarray
-    original_mesh: trimesh.Trimesh
-    aabbs: np.ndarray
+    bounds: np.ndarray = field(init=False)
+
+    def __post_init__(self):
+        self._refresh_bounds()
+
+    @classmethod
+    def from_file(cls, path: str, name: str, color: Sequence[float],
+                  offset: Optional[np.ndarray] = None) -> "TetrahedralMesh":
+        import tetgen
+
+        surface = trimesh.load(path, force="mesh")
+        if offset is not None:
+            surface.apply_translation(offset)
+        tet = tetgen.TetGen(surface.vertices, surface.faces)
+        # Newer tetgen builds return extra trailing arrays; only nodes and elements are needed.
+        vertices, tetrahedra = tet.tetrahedralize(order=1, mindihedral=20, minratio=1.5, quality=True)[:2]
+        logger.info("%-6s %8s tetrahedra from %s vertices", name, f"{len(tetrahedra):,}", f"{len(vertices):,}")
+        return cls(name, list(color), np.asarray(vertices, dtype=np.float64), np.asarray(tetrahedra))
+
+    def _refresh_bounds(self):
+        corners = self.vertices[self.tetrahedra]
+        self.bounds = np.concatenate([corners.min(axis=1), corners.max(axis=1)], axis=1)
+
+    def set_vertices(self, vertices: np.ndarray):
+        self.vertices = vertices
+        self._refresh_bounds()
+
+    def translate(self, offset: np.ndarray):
+        self.set_vertices(self.vertices + offset)
+
+    def apply_transform(self, matrix: np.ndarray):
+        self.set_vertices(trimesh.transform_points(self.vertices, matrix))
+
+    def corners_of(self, indices: np.ndarray) -> np.ndarray:
+        """Flatten the 4 vertices of the selected tetrahedra into (n, 12) rows."""
+        return self.vertices[self.tetrahedra[indices]].reshape(-1, 12)
 
 
-class Preprocessing:
-    """Handles vectorized data transformations for the PyTorch model."""
-    @staticmethod
-    def principal_axis_transform(input_tensor: torch.Tensor) -> torch.Tensor:
-        data = input_tensor.to(torch.float64)
-        batch_size = data.size(0)
-        tetra1 = data[:, :12].view(batch_size, 4, 3)
-        tetra2 = data[:, 12:].view(batch_size, 4, 3)
-        centroid1 = torch.mean(tetra1, dim=1, keepdim=True)
-        tetra1_centered = tetra1 - centroid1
-        cov_matrix = torch.bmm(tetra1_centered.transpose(1, 2), tetra1_centered)
-        _, eigenvectors = torch.linalg.eigh(cov_matrix)
-        tetra2_centered = tetra2 - centroid1
-        tetra1_transformed = torch.bmm(tetra1_centered, eigenvectors)
-        tetra2_transformed = torch.bmm(tetra2_centered, eigenvectors)
-        return torch.cat([
-            tetra1_transformed.view(batch_size, 12),
-            tetra2_transformed.view(batch_size, 12)
-        ], dim=1).to(torch.float64)
+# --------------------------------------------------------------------------- #
+# Narrow-phase model
+# --------------------------------------------------------------------------- #
 
-class TetrahedralGenerator:
-    """Handles tetrahedralization and property calculation for meshes."""
-    @staticmethod
-    def tetrahedralize_with_tetgen(mesh: trimesh.Trimesh) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        try:
-            import tetgen
-            tet = tetgen.TetGen(mesh.vertices, mesh.faces)
-            result = tet.tetrahedralize(order=1, mindihedral=20, minratio=1.5, quality=True)
-            if isinstance(result, tuple):
-                if len(result) == 2:
-                    vertices, tetrahedra = result
-                elif len(result) >= 3:
-                    vertices, tetrahedra = result[0], result[1]
-                else:
-                    raise ValueError("Unexpected TetGen return shape")
-            else:
-                vertices, tetrahedra = result
-            logger.info(f"Generated {len(tetrahedra)} tetrahedra from {len(vertices)} vertices")
-            return vertices, tetrahedra
-        except Exception as e:
-            logger.error(f"TetGen tetrahedralization failed: {e}")
-            return None, None
+# One non-degenerate pair of unit tetrahedra, used to validate model/transform pairing.
+_PROBE_PAIR = torch.tensor(
+    [[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] * 2], dtype=torch.float64
+)
 
-    @staticmethod
-    def calculate_aabbs(vertices: np.ndarray, tetrahedra: np.ndarray) -> np.ndarray:
-        tet_vertices = vertices[tetrahedra]
-        return np.stack([np.min(tet_vertices, axis=1), np.max(tet_vertices, axis=1)], axis=1)
 
 class CollisionDetector:
-    """Handles collision detection between tetrahedra using a PyTorch model."""
-    def __init__(self, model: Optional[torch.nn.Module] = None):
-        self.model = model
-        self.device = 'cpu' # torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if model: self.set_model(model)
+    """Classifies tetrahedron pairs with a TorchScript model fed by a transform chain."""
 
-    def set_model(self, model: torch.nn.Module):
-        self.model = model
-        self.model.to(self.device).eval()
-        logger.info(f"PyTorch collision model loaded onto {self.device}!")
-
-    def detect_collisions_in_batch(self, batch_tensor: torch.Tensor) -> List[bool]:
-        if not self.model: return [False] * len(batch_tensor)
+    def __init__(self, model_path: str, transforms: Sequence[str], device: str = "cpu"):
+        self.device = device
+        self.transforms = tuple(transforms)
+        self.pipeline = build_pipeline(self.transforms)
+        self.model = torch.jit.load(model_path, map_location=device).double().eval()
         try:
-            with torch.no_grad():
-                input_tensor = batch_tensor.to(self.device)
-                transformed = Preprocessing.principal_axis_transform(input_tensor)
-                output = self.model(transformed)
-                return (output > 0.5).cpu().numpy().flatten()
-        except Exception as e:
-            logger.error(f"PyTorch model inference failed: {e}")
-            return [False] * len(batch_tensor)
+            self.classify(_PROBE_PAIR)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Model '{model_path}' rejects the transform chain {self.transforms}. "
+                f"Known pairings: {MODEL_TRANSFORMS}"
+            ) from exc
+        logger.info("Loaded %s on %s with transforms %s", model_path, device, self.transforms)
+
+    def classify(self, pairs: torch.Tensor) -> np.ndarray:
+        """True where the model predicts the tetrahedron pair intersects."""
+        with torch.no_grad():
+            logits = self.model(self.pipeline(pairs.to(self.device)))
+        # The bundled models emit two logits per pair; class 0 means intersecting.
+        return (logits.argmax(dim=1) == 0).cpu().numpy()
+
+
+# --------------------------------------------------------------------------- #
+# Visualization
+# --------------------------------------------------------------------------- #
 
 
 class VisualizationManager:
     """Manages Polyscope volume mesh visualization."""
-    def __init__(self, config: SimulationConfig): self.config = config
-    def initialize(self): ps.init()
-    
-    def register_mesh(self, name: str, mesh: TetrahedralMesh, color: List[float]):
-        ps_mesh = ps.register_volume_mesh(name, mesh.vertices, mesh.tetrahedra)
-        ps_mesh.set_color(color)
 
-    def update_mesh_positions(self, name: str, vertices: np.ndarray):
-        ps.get_volume_mesh(name).update_vertex_positions(vertices)
-    
-    def update_collision_colors(self, name_a: str, mesh_a: TetrahedralMesh, name_b: str, mesh_b: TetrahedralMesh, collision_pairs: List[Tuple[int, int]]):
-        colors_a = np.tile(self.config.default_color_a, (len(mesh_a.tetrahedra), 1))
-        colors_b = np.tile(self.config.default_color_b, (len(mesh_b.tetrahedra), 1))
-        colliding_tets_a = {p[0] for p in collision_pairs}
-        colliding_tets_b = {p[1] for p in collision_pairs}
-        for tet_idx in colliding_tets_a: colors_a[tet_idx] = self.config.collision_color
-        for tet_idx in colliding_tets_b: colors_b[tet_idx] = self.config.collision_color
-        ps.get_volume_mesh(name_a).add_color_quantity("collisions", colors_a, defined_on='cells', enabled=True)
-        ps.get_volume_mesh(name_b).add_color_quantity("collisions", colors_b, defined_on='cells', enabled=True)
+    def __init__(self, config: SimulationConfig):
+        self.config = config
+        self.headless = False
+
+    def initialize(self, force_headless: bool = False):
+        quiet = not logger.isEnabledFor(logging.DEBUG)
+        if not force_headless:
+            try:
+                with quiet_native_stdout(quiet):
+                    ps.init()
+                self.headless = ps.is_headless()
+                return
+            except RuntimeError as e:
+                logger.warning("Interactive Polyscope backend unavailable (%s); falling back to headless EGL.", e)
+        ps.set_allow_headless_backends(True)
+        with quiet_native_stdout(quiet):
+            ps.init("openGL3_egl")
+        self.headless = ps.is_headless()
+        logger.info("Polyscope running headless; frames must be captured with screenshots.")
+
+    def register(self, mesh: TetrahedralMesh):
+        ps.register_volume_mesh(mesh.name, mesh.vertices, mesh.tetrahedra).set_color(mesh.color)
+
+    def sync_positions(self, mesh: TetrahedralMesh):
+        ps.get_volume_mesh(mesh.name).update_vertex_positions(mesh.vertices)
+
+    def shade_collisions(self, mesh: TetrahedralMesh, colliding: np.ndarray):
+        colors = np.tile(mesh.color, (len(mesh.tetrahedra), 1))
+        colors[colliding] = self.config.collision_color
+        ps.get_volume_mesh(mesh.name).add_color_quantity(
+            "collisions", colors, defined_on="cells", enabled=True
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Simulation
+# --------------------------------------------------------------------------- #
+
+_NO_PAIRS = np.empty((0, 2), dtype=np.int64)
+
+
+@dataclass
+class StepStats:
+    """Per-step pipeline metrics backing the progress line and the run summary."""
+    step: int
+    candidates: int
+    collisions: int
+    broad_s: float
+    narrow_s: float
+
+    @property
+    def detection_s(self) -> float:
+        return self.broad_s + self.narrow_s
 
 
 class TetrahedralCollisionSimulator:
-    def __init__(self, config: Optional[SimulationConfig] = None):
-        self.config = config or SimulationConfig()
-        self.collision_detector = CollisionDetector()
-        self.visualization_manager = VisualizationManager(self.config)
-        self.mesh_a: Optional[TetrahedralMesh] = None
-        self.mesh_b: Optional[TetrahedralMesh] = None
-        self.mesh_a_original_vertices: Optional[np.ndarray] = None
+    """Drives the moving mesh toward the static mesh and reports colliding tetrahedra."""
+
+    def __init__(self, config: SimulationConfig, detector: CollisionDetector,
+                 static_mesh: TetrahedralMesh, moving_mesh: TetrahedralMesh):
+        self.config = config
+        self.detector = detector
+        self.static_mesh = static_mesh
+        self.moving_mesh = moving_mesh
+        self.visualization_manager = VisualizationManager(config)
+        self.step_size = -config.initial_offset / config.num_steps
+        self.home_vertices = [mesh.vertices.copy() for mesh in self.meshes]
         self.current_step = 0
-        self.step_size: Optional[np.ndarray] = None
-        self.collision_pairs: List[Tuple[int, int]] = []
-        self.candidate_pairs: List[Tuple[int, int]] = []  # Pairs of indices for broad phase
-        self.is_playing: bool = False  # State for play/stop functionality
-        self._inference_lock = threading.Lock()
-        
-    def set_collision_model(self, model: torch.nn.Module):
-        self.collision_detector.set_model(model)
-    
-    def load_mesh(self, mesh_path: str, apply_offset: bool = False) -> Optional[TetrahedralMesh]:
-        try:
-            original_mesh = trimesh.load(mesh_path, force='mesh')
-            if apply_offset: original_mesh.apply_translation(self.config.initial_offset)
-            vertices, tetrahedra = TetrahedralGenerator.tetrahedralize_with_tetgen(original_mesh)
-            if vertices is None: return None
-            aabbs = TetrahedralGenerator.calculate_aabbs(vertices, tetrahedra)
-            return TetrahedralMesh(vertices, tetrahedra, original_mesh, aabbs)
-        except Exception as e:
-            logger.error(f"Failed to load mesh {mesh_path}: {e}")
-            return None
-    
-    def load_meshes(self, mesh_a_path: str, mesh_b_path: str) -> bool:
-        self.mesh_a = self.load_mesh(mesh_a_path)
-        self.mesh_b = self.load_mesh(mesh_b_path, apply_offset=True)
-        if not (self.mesh_a and self.mesh_b): return False
-        self.mesh_a_original_vertices = self.mesh_a.vertices.copy()
-        self.step_size = -self.config.initial_offset / self.config.num_steps
-        logger.info("Successfully loaded and prepared meshes.")
-        return True
-    
+        self.candidate_pairs = _NO_PAIRS
+        self.collision_pairs = _NO_PAIRS
+        self.is_playing = False
+        self.history: List[StepStats] = []
+        self.run_started: Optional[float] = None
 
-    def broad_phase(self):
+    @property
+    def meshes(self) -> Tuple[TetrahedralMesh, TetrahedralMesh]:
+        return self.static_mesh, self.moving_mesh
 
-        broad_phase_start_time = time.time()
+    def broad_phase(self) -> np.ndarray:
+        """Return (n, 2) AABB-overlapping tetrahedron indices into the static/moving meshes."""
+        tree = trimesh.util.bounds_tree(self.static_mesh.bounds)
+        pairs = {
+            (int(index_static), index_moving)
+            for index_moving, box in enumerate(self.moving_mesh.bounds)
+            for index_static in tree.intersection(box)
+        }
+        return np.array(sorted(pairs), dtype=np.int64).reshape(-1, 2)
 
-        # Debug: Check the relationship between AABBs and tetrahedra
-        logger.info(f"Mesh A: {len(self.mesh_a.tetrahedra)} tetrahedra, {len(self.mesh_a.aabbs)} AABBs")
-        logger.info(f"Mesh B: {len(self.mesh_b.tetrahedra)} tetrahedra, {len(self.mesh_b.aabbs)} AABBs")
+    def narrow_phase(self, candidates: np.ndarray) -> np.ndarray:
+        """Return the subset of `candidates` the model classifies as intersecting."""
+        if len(candidates) == 0:
+            return candidates
+        pair_data = torch.from_numpy(np.concatenate(
+            [mesh.corners_of(candidates[:, column]) for column, mesh in enumerate(self.meshes)],
+            axis=1,
+        ))
+        hits = np.concatenate([
+            self.detector.classify(pair_data[offset:offset + self.config.batch_size])
+            for offset in range(0, len(candidates), self.config.batch_size)
+        ])
+        return candidates[hits]
 
-        # Ensure we only use AABBs that correspond to actual tetrahedra
-        max_tetrahedra_a = len(self.mesh_a.tetrahedra)
-        max_tetrahedra_b = len(self.mesh_b.tetrahedra)
+    def detect_collisions(self) -> Tuple[float, float]:
+        start = time.perf_counter()
+        self.candidate_pairs = self.broad_phase()
+        broad_s = time.perf_counter() - start
 
-        # 1. Create an R-tree for the AABBs of the first mesh.
-        bounds_a = self.mesh_a.aabbs[:max_tetrahedra_a].reshape(-1, 6)
-        tree_a = trimesh.util.bounds_tree(bounds_a)
+        start = time.perf_counter()
+        self.collision_pairs = self.narrow_phase(self.candidate_pairs)
+        return broad_s, time.perf_counter() - start
 
-        # 2. Use a set to store unique pairs and avoid duplicates
-        candidate_pairs_set = set()
-        bounds_b = self.mesh_b.aabbs[:max_tetrahedra_b].reshape(-1, 6)
-
-        for index_b, aabb_b in enumerate(bounds_b):
-            # Safety check: ensure index_b is within bounds
-            if index_b >= max_tetrahedra_b:
-                continue
-                
-            # The 'intersection' method returns indices from tree_a (mesh_a)
-            intersecting_indices_a = tree_a.intersection(aabb_b)
-            
-            for index_a in intersecting_indices_a:
-                # Safety check: ensure index_a is within bounds
-                if index_a >= max_tetrahedra_a:
-                    continue
-                candidate_pairs_set.add((index_a, index_b))
-
-        # Convert set back to list for compatibility with existing code
-        self.candidate_pairs = list(candidate_pairs_set)
-
-        logger.info(f"Broad phase complete in {time.time() - broad_phase_start_time:.4f}s. Found {len(self.candidate_pairs)} unique candidates.")
-
-    def narrow_phase(self):
-        """Perform narrow-phase collision detection in a single-threaded loop."""
-        start_time = time.time()
-
-        # No candidates, clear and exit
-        if not self.candidate_pairs:
-            self.collision_pairs = []
-            return
-
-        # Prepare vertex data for all candidate pairs
-        pairs = np.array(self.candidate_pairs)
-        idx_a, idx_b = pairs[:, 0], pairs[:, 1]
-        verts_a = self.mesh_a.vertices[self.mesh_a.tetrahedra[idx_a]].reshape(-1, 12)
-        verts_b = self.mesh_b.vertices[self.mesh_b.tetrahedra[idx_b]].reshape(-1, 12)
-        data = np.concatenate((verts_a, verts_b), axis=1)
-
-        # Batch inference loop (single-threaded)
-        self.collision_pairs = []
-        batch_size = self.config.batch_size
-        total = len(self.candidate_pairs)
-
-        for start in range(0, total, batch_size):
-            end = min(start + batch_size, total)
-            batch_data = torch.tensor(data[start:end], dtype=torch.float64)
-            results = self.collision_detector.detect_collisions_in_batch(batch_data)
-            for pair, hit in zip(self.candidate_pairs[start:end], results):
-                if hit:
-                    self.collision_pairs.append(pair)
-
-        elapsed = time.time() - start_time
-        logger.info(f"Narrow phase complete in {elapsed:.4f}s. Confirmed {len(self.collision_pairs)} colliding pairs.")
-
-
-    def detect_collisions(self):
-        if not self.mesh_a or not self.mesh_b: return
-
-        self.broad_phase()
-
-        # Debug: Check the relationship between AABBs and tetrahedra
-        logger.info(f"Mesh A: {len(self.mesh_a.tetrahedra)} tetrahedra, {len(self.mesh_a.aabbs)} AABBs")
-        logger.info(f"Mesh B: {len(self.mesh_b.tetrahedra)} tetrahedra, {len(self.mesh_b.aabbs)} AABBs")
-
-        if not self.candidate_pairs:
-            self.collision_pairs = []
-            return
-
-        self.narrow_phase()
-
-    def rotate_static_mesh(self):
-        if not self.mesh_a or not self.config.rotate_static:
-            return
-
-        center = np.mean(self.mesh_a.vertices, axis=0)
-        angle = self.config.rotation_speed
-        axis = self.config.rotation_axis
-        transform = trimesh.transformations.rotation_matrix(angle, axis, point=center)
-        self.mesh_a.vertices = trimesh.transform_points(self.mesh_a.vertices, transform)
-        self.mesh_a.aabbs = TetrahedralGenerator.calculate_aabbs(self.mesh_a.vertices, self.mesh_a.tetrahedra)
-        self.visualization_manager.update_mesh_positions("Mesh A", self.mesh_a.vertices)
+    def refresh_visualization(self):
+        for column, mesh in enumerate(self.meshes):
+            self.visualization_manager.sync_positions(mesh)
+            self.visualization_manager.shade_collisions(mesh, self.collision_pairs[:, column])
 
     def step_forward(self):
         if self.current_step >= self.config.num_steps:
-            self.is_playing = False # Stop playing at the end
+            self.is_playing = False
             return
-        if not self.mesh_b or self.step_size is None: return
-        
-        self.mesh_b.vertices += self.step_size
-        self.mesh_b.aabbs = TetrahedralGenerator.calculate_aabbs(self.mesh_b.vertices, self.mesh_b.tetrahedra)
-        self.visualization_manager.update_mesh_positions("Mesh B", self.mesh_b.vertices)
+        if self.run_started is None:
+            self.run_started = time.perf_counter()
 
+        self.moving_mesh.translate(self.step_size)
         if self.config.rotate_static:
-            self.rotate_static_mesh()
-        
-        self.detect_collisions()
-        self.visualization_manager.update_collision_colors("Mesh A", self.mesh_a, "Mesh B", self.mesh_b, self.collision_pairs)
-        self.current_step += 1
-    
-    def reset_simulation(self):
-        self.is_playing = False # Stop playing on reset
-        if not self.mesh_b or self.step_size is None: return
-        
-        self.mesh_b.vertices -= self.step_size * self.current_step
-        self.mesh_b.aabbs = TetrahedralGenerator.calculate_aabbs(self.mesh_b.vertices, self.mesh_b.tetrahedra)
-        self.visualization_manager.update_mesh_positions("Mesh B", self.mesh_b.vertices)
+            rotation = trimesh.transformations.rotation_matrix(
+                self.config.rotation_speed,
+                self.config.rotation_axis,
+                point=self.static_mesh.vertices.mean(axis=0),
+            )
+            self.static_mesh.apply_transform(rotation)
 
-        if self.mesh_a_original_vertices is not None:
-            self.mesh_a.vertices = self.mesh_a_original_vertices.copy()
-            self.mesh_a.aabbs = TetrahedralGenerator.calculate_aabbs(self.mesh_a.vertices, self.mesh_a.tetrahedra)
-            self.visualization_manager.update_mesh_positions("Mesh A", self.mesh_a.vertices)
-        
+        broad_s, narrow_s = self.detect_collisions()
+        self.refresh_visualization()
+        self.current_step += 1
+        self._log_step(broad_s, narrow_s)
+
+        if self.current_step >= self.config.num_steps:
+            self.log_summary()
+
+    def _log_step(self, broad_s: float, narrow_s: float):
+        stats = StepStats(self.current_step, len(self.candidate_pairs),
+                          len(self.collision_pairs), broad_s, narrow_s)
+        self.history.append(stats)
+        total_candidates = sum(s.candidates for s in self.history)
+        detection_s = sum(s.detection_s for s in self.history)
+        aggregate = (f"{detection_s / total_candidates * 1e6:6.2f}us/cand"
+                     if total_candidates else "-".center(13))
+        logger.info(
+            "step %3d/%-3d  cand %11s  hit %11s  broad %7.3fs  narrow %7.3fs  elapsed %7.1fs  agg %s",
+            stats.step, self.config.num_steps, f"{stats.candidates:,}", f"{stats.collisions:,}",
+            stats.broad_s, stats.narrow_s, time.perf_counter() - self.run_started, aggregate,
+        )
+
+    def log_summary(self):
+        if not self.history:
+            return
+        total_candidates = sum(s.candidates for s in self.history)
+        total_collisions = sum(s.collisions for s in self.history)
+        detection_s = sum(s.detection_s for s in self.history)
+        busiest = max(self.history, key=lambda s: s.candidates)
+        slowest = max(self.history, key=lambda s: s.detection_s)
+
+        logger.info("")
+        logger.info("run summary   %d steps  %s candidates  %s collisions",
+                    len(self.history), f"{total_candidates:,}", f"{total_collisions:,}")
+        for label, attr in (("broad", "broad_s"), ("narrow", "narrow_s")):
+            get = attrgetter(attr)
+            times = [get(s) for s in self.history]
+            peak = max(self.history, key=get)
+            logger.info("  %-6s      %8.2fs total  %7.3fs mean  %7.3fs peak (step %d)",
+                        label, sum(times), sum(times) / len(times), get(peak), peak.step)
+        broad_share = 100.0 * sum(s.broad_s for s in self.history) / detection_s if detection_s else 0.0
+        logger.info("  detection   %8.2fs total  %s  broad %.0f%% / narrow %.0f%%",
+                    detection_s,
+                    f"{detection_s / total_candidates * 1e6:.2f}us/cand aggregate"
+                    if total_candidates else "no candidates",
+                    broad_share, 100.0 - broad_share)
+        logger.info("  busiest     step %d (%s candidates)   slowest  step %d (%.2fs)",
+                    busiest.step, f"{busiest.candidates:,}", slowest.step, slowest.detection_s)
+
+    def reset_simulation(self):
+        self.is_playing = False
         self.current_step = 0
-        self.collision_pairs = []
-        self.candidate_pairs = []
-        self.visualization_manager.update_collision_colors("Mesh A", self.mesh_a, "Mesh B", self.mesh_b, [])
+        self.candidate_pairs = _NO_PAIRS
+        self.collision_pairs = _NO_PAIRS
+        self.history.clear()
+        self.run_started = None
+        for mesh, home in zip(self.meshes, self.home_vertices):
+            mesh.set_vertices(home.copy())
+        self.refresh_visualization()
         logger.info("Simulation reset.")
-    
-    def initialize_visualization(self):
-        self.visualization_manager.initialize()
-        if self.mesh_a and self.mesh_b:
-            self.visualization_manager.register_mesh("Mesh A", self.mesh_a, self.config.default_color_a)
-            self.visualization_manager.register_mesh("Mesh B", self.mesh_b, self.config.default_color_b)
-    
+
+    def initialize_visualization(self, force_headless: bool = False):
+        self.visualization_manager.initialize(force_headless)
+        for mesh in self.meshes:
+            self.visualization_manager.register(mesh)
+
     def create_ui_callback(self):
         def ui_callback():
             psim.Text(f"Step: {self.current_step}/{self.config.num_steps}")
+            psim.Text(f"Transforms: {' -> '.join(self.detector.transforms)}")
 
-            # Show Play or Stop button based on the current state and update the state
-            if not self.is_playing:
-                if psim.Button("Play"):
-                    # Start playing if not already at the end
-                    if self.current_step < self.config.num_steps:
-                        self.is_playing = True
-            else:
+            if self.is_playing:
                 if psim.Button("Stop"):
                     self.is_playing = False
+            elif psim.Button("Play") and self.current_step < self.config.num_steps:
+                self.is_playing = True
 
             psim.SameLine()
-            if psim.Button("Reset"): 
-                self.reset_simulation() # This method also sets is_playing to False
-            
+            if psim.Button("Reset"):
+                self.reset_simulation()
+
             psim.Separator()
             psim.Text(f"Candidate Pairs: {len(self.candidate_pairs)}")
             psim.Text(f"Colliding Pairs: {len(self.collision_pairs)}")
 
-            # If playing, advance the simulation for the NEXT frame
             if self.is_playing:
                 self.step_forward()
-            
+
         return ui_callback
 
 
-def main():
+STATIC_COLOR = [0.3, 0.3, 1.0]
+MOVING_COLOR = [0.3, 1.0, 0.3]
+
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the tetrahedral collision simulator")
-    parser.add_argument("--model", "-M", type=str, default="model/TetrahedronPairNet_L_principal_axis.pt",
-                        help="Path to the PyTorch collision model")
-    parser.add_argument("--mesh-a", type=str, default="data/spot.obj",
+    parser.add_argument("--model", "-M", type=str, default="model/EuroGraphicsDemo_PCA_Unit.pt",
+                        help="Path to the TorchScript collision model")
+    parser.add_argument("--transform", "-T", nargs="+", choices=sorted(TRANSFORMS), default=None,
+                        metavar="NAME",
+                        help=f"Transform chain applied before inference, in order "
+                             f"(choices: {sorted(TRANSFORMS)}); defaults to the chain "
+                             f"registered for the selected model")
+    parser.add_argument("--mesh-a", type=str, default="data/armadillo.obj",
                         help="Path to the first (static) mesh OBJ file")
     parser.add_argument("--mesh-b", type=str, default=None,
                         help="Path to the second (moving) mesh OBJ file; defaults to the same file as --mesh-a")
     parser.add_argument("--num-steps", type=int, default=50,
                         help="Number of simulation steps")
+    parser.add_argument("--batch-size", type=int, default=2048,
+                        help="Tetrahedron pairs per inference batch")
     parser.add_argument("--offset-x", type=float, default=2.5,
                         help="Initial x offset for the moving mesh")
     parser.add_argument("--rotate-static", action="store_true",
                         help="Rotate the static mesh while the second mesh moves")
-    parser.add_argument("--rotation-speed", type=float, default=np.pi / 180 * 10,
+    parser.add_argument("--rotation-speed", type=float, default=np.radians(10.0),
                         help="Static mesh rotation speed in radians per step")
     parser.add_argument("--rotation-axis", type=float, nargs=3, default=[0.0, 1.0, 0.0],
                         help="Rotation axis for the static mesh")
     parser.add_argument("--cpu", action="store_true",
                         help="Force CPU execution even if CUDA is available")
+    parser.add_argument("--headless", action="store_true",
+                        help="Skip the interactive window and render every step to PNG screenshots")
+    parser.add_argument("--screenshot-dir", type=str, default="screenshots",
+                        help="Directory for headless screenshots")
+    parser.add_argument("--log-level", choices=LOG_LEVELS, default="INFO",
+                        help="Logging verbosity; DEBUG adds timestamps and reveals polyscope's banner")
+    return parser.parse_args()
 
-    args = parser.parse_args()
-    mesh_b_path = args.mesh_b if args.mesh_b is not None else args.mesh_a
+
+def main():
+    args = parse_args()
+    configure_logging(args.log_level)
 
     config = SimulationConfig(
         num_steps=args.num_steps,
+        batch_size=args.batch_size,
         initial_offset=np.array([args.offset_x, 0.0, 0.0]),
         rotate_static=args.rotate_static,
         rotation_speed=args.rotation_speed,
-        rotation_axis=np.array(args.rotation_axis)
+        rotation_axis=np.array(args.rotation_axis),
     )
 
-    simulator = TetrahedralCollisionSimulator(config)
-    try:
-        device = torch.device("cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu"))
-        try:
-            model = torch.load(args.model, map_location=device, weights_only=False)
-        except TypeError:
-            model = torch.load(args.model, map_location=device)
-        model.double()
-        simulator.set_collision_model(model)
-    except FileNotFoundError:
-        logger.error(f"Model file not found. Place it at '{args.model}'")
-    except Exception as e:
-        logger.error(f"Failed to load PyTorch model: {e}")
+    device = "cpu" if args.cpu or not torch.cuda.is_available() else "cuda"
+    transforms = tuple(args.transform) if args.transform else transforms_for_model(args.model)
+    detector = CollisionDetector(args.model, transforms, device=device)
 
-    if not simulator.load_meshes(args.mesh_a, mesh_b_path):
+    static_mesh = TetrahedralMesh.from_file(args.mesh_a, "Mesh A", STATIC_COLOR)
+    moving_mesh = TetrahedralMesh.from_file(args.mesh_b or args.mesh_a, "Mesh B", MOVING_COLOR,
+                                            offset=config.initial_offset)
+
+    simulator = TetrahedralCollisionSimulator(config, detector, static_mesh, moving_mesh)
+    simulator.initialize_visualization(force_headless=args.headless)
+
+    if simulator.visualization_manager.headless:
+        out_dir = Path(args.screenshot_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ps.screenshot(str(out_dir / "step_000.png"))
+        for _ in range(config.num_steps):
+            simulator.step_forward()
+            ps.screenshot(str(out_dir / f"step_{simulator.current_step:03d}.png"))
+        logger.info("Wrote %d frames to %s", config.num_steps + 1, out_dir.resolve())
         return
 
-    simulator.initialize_visualization()
     ps.set_user_callback(simulator.create_ui_callback())
     ps.show()
 
