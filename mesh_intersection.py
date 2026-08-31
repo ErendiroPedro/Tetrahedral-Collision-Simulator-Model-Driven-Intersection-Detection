@@ -975,6 +975,64 @@ class PolyscopeSimulationUI:
         self.simulator = simulator
         self.is_playing = False
 
+    @staticmethod
+    def _draw_current_step_pipeline(history: Sequence[StepStats]) -> None:
+        """Draw the broad-to-narrow funnel for the most recently completed step."""
+        psim.Separator()
+        psim.TextUnformatted("Current Step Pipeline")
+        if not history:
+            psim.TextUnformatted("No completed steps yet.")
+            return
+
+        latest_stats = history[-1]
+        psim.Text(
+            f"Candidates Found: {latest_stats.candidates:,}  "
+            f"(broad: {latest_stats.broad_s * 1e3:.2f} ms)"
+        )
+        psim.TextUnformatted("  ->")
+        psim.Text(
+            f"Actual Collisions: {latest_stats.collisions:,}  "
+            f"(narrow: {latest_stats.narrow_s * 1e3:.2f} ms)"
+        )
+        if latest_stats.candidates:
+            filtered_count = latest_stats.candidates - latest_stats.collisions
+            filtered_percentage = 100.0 * filtered_count / latest_stats.candidates
+            psim.Text(
+                f"Filtered Out: {filtered_count:,} ({filtered_percentage:.1f}%)"
+            )
+        else:
+            psim.TextUnformatted("Filtered Out: 0 (N/A; no candidates)")
+
+    @staticmethod
+    def _draw_aggregate_metrics(history: Sequence[StepStats]) -> None:
+        """Draw cumulative and per-step detection timings split across both phases."""
+        psim.Separator()
+        psim.TextUnformatted("Aggregate Metrics")
+        if not history:
+            psim.TextUnformatted("No completed steps yet.")
+            return
+
+        total_broad_s = sum(stats.broad_s for stats in history)
+        total_narrow_s = sum(stats.narrow_s for stats in history)
+        total_detection_s = total_broad_s + total_narrow_s
+        psim.Text(f"Total Detection Time: {total_detection_s:.2f} s")
+
+        if total_detection_s > 0.0:
+            broad_share = 100.0 * total_broad_s / total_detection_s
+            psim.Text(
+                f"Time Split: {broad_share:.0f}% Broad / "
+                f"{100.0 - broad_share:.0f}% Narrow"
+            )
+        else:
+            psim.TextUnformatted("Time Split: N/A (no measured time)")
+
+        completed_steps = len(history)
+        psim.Text(f"Avg Broad/Step:  {total_broad_s / completed_steps * 1e3:.2f} ms")
+        psim.Text(f"Avg Narrow/Step: {total_narrow_s / completed_steps * 1e3:.2f} ms")
+        psim.Text(
+            f"Avg Total/Step:  {total_detection_s / completed_steps * 1e3:.2f} ms"
+        )
+
     def draw(self) -> None:
         """Draw one control-panel frame and advance the simulation during playback."""
         simulator = self.simulator
@@ -999,9 +1057,8 @@ class PolyscopeSimulationUI:
             self.is_playing = False
             simulator.reset_simulation()
 
-        psim.Separator()
-        psim.Text(f"Candidate Pairs: {len(simulator.candidate_pairs)}")
-        psim.Text(f"Colliding Pairs: {len(simulator.collision_pairs)}")
+        self._draw_current_step_pipeline(simulator.history)
+        self._draw_aggregate_metrics(simulator.history)
 
         if self.is_playing:
             if simulator.current_step < config.num_steps:
