@@ -2,7 +2,8 @@
 Tetrahedral Collision Simulator
 
 Detects collisions between two tetrahedral meshes with a two-stage pipeline:
-1. Broad phase: R-tree over per-tetrahedron AABBs (``trimesh.util.bounds_tree``).
+1. Broad phase: per-tetrahedron AABB overlap via a torch spatial hash grid on the
+   inference device.
 2. Narrow phase: batched TorchScript inference over a configurable transform chain.
 3. Visualization: polyscope volume meshes with colliding cells highlighted.
 
@@ -13,23 +14,19 @@ bundled model declares its expected chain in ``MODEL_TRANSFORMS``.
 from __future__ import annotations
 
 import argparse
-import contextlib
-import ctypes
 import logging
-import os
+import math
 import time
 from dataclasses import dataclass, field
 from operator import attrgetter
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import polyscope as ps
 import polyscope.imgui as psim
 import torch
 import trimesh
-import trimesh.util
-from rtree import core as rtree_core
 
 logger = logging.getLogger(__name__)
 
@@ -59,27 +56,6 @@ def configure_logging(level_name: str) -> None:
         else _CompactFormatter()
     )
     logging.basicConfig(level=level, handlers=[handler], force=True)
-
-
-@contextlib.contextmanager
-def quiet_native_stdout(enabled: bool = True) -> Iterator[None]:
-    """Optionally redirect native writes to stdout while the context is active.
-
-    Polyscope prints its backend banner directly to file descriptor 1, bypassing Python's
-    logging streams, so temporarily replacing that descriptor is the only reliable mute.
-    """
-    if not enabled:
-        yield
-        return
-    saved_stdout_fd = os.dup(1)
-    null_fd = os.open(os.devnull, os.O_WRONLY)
-    try:
-        os.dup2(null_fd, 1)
-        yield
-    finally:
-        os.dup2(saved_stdout_fd, 1)
-        os.close(null_fd)
-        os.close(saved_stdout_fd)
 
 
 # --------------------------------------------------------------------------- #
@@ -119,6 +95,14 @@ def principal_axis(data: torch.Tensor) -> torch.Tensor:
     return aligned_pairs.flatten(1)
 
 
+def _unit_coordinates(
+    edge_matrices: torch.Tensor, relative_positions: torch.Tensor
+) -> torch.Tensor:
+    """Solve each static frame; keep translated coordinates only for singular frames."""
+    columns, info = torch.linalg.solve_ex(edge_matrices, relative_positions.transpose(1, 2))
+    return torch.where(info[:, None, None] == 0, columns.transpose(1, 2), relative_positions)
+
+
 def unit_frame(data: torch.Tensor) -> torch.Tensor:
     """Map moving vertices into the static tetrahedron's unit-simplex frame.
 
@@ -131,16 +115,7 @@ def unit_frame(data: torch.Tensor) -> torch.Tensor:
     static_edges = static_tetrahedra[:, 1:] - static_origins
     relative_positions = moving_tetrahedra - static_origins
 
-    edge_matrices = static_edges.transpose(1, 2)
-    relative_position_columns = relative_positions.transpose(1, 2)
-    try:
-        unit_frame_columns = torch.linalg.solve(
-            edge_matrices, relative_position_columns
-        )
-        relative_positions = unit_frame_columns.transpose(1, 2)
-    except torch.linalg.LinAlgError:  # degenerate tetrahedron: keep the translated coordinates
-        pass
-    return relative_positions.flatten(1)
+    return _unit_coordinates(static_edges.transpose(1, 2), relative_positions).flatten(1)
 
 
 TRANSFORMS: Dict[str, Transform] = {
@@ -191,10 +166,10 @@ class SimulationConfig:
     num_steps: int = 50
     batch_size: int = 2048
     initial_offset: np.ndarray = field(
-        default_factory=lambda: np.array([3.0, 0.0, 0.0])
+        default_factory=lambda: np.array([2.5, 0.0, 0.0])
     )
     rotate_static: bool = False
-    rotation_speed: float = np.radians(2.0)  # radians per step
+    rotation_speed: float = np.radians(10.0)  # radians per step
     rotation_axis: np.ndarray = field(default_factory=lambda: np.array([0.0, 1.0, 0.0]))
     collision_color: List[float] = field(default_factory=lambda: [1.0, 0.0, 0.0])
 
@@ -269,6 +244,7 @@ class TetrahedralMesh:
     vertices: np.ndarray
     tetrahedra: np.ndarray
     bounds: np.ndarray = field(init=False)
+    envelope: np.ndarray = field(init=False)
 
     def __post_init__(self) -> None:
         """Derive broad-phase bounds after dataclass initialization."""
@@ -310,6 +286,10 @@ class TetrahedralMesh:
         """Recompute one axis-aligned bounding box per tetrahedron from current vertices."""
         corners = self.vertices[self.tetrahedra]
         self.bounds = np.concatenate([corners.min(axis=1), corners.max(axis=1)], axis=1)
+        if len(self.vertices):
+            self.envelope = np.stack((self.vertices.min(axis=0), self.vertices.max(axis=0)))
+        else:
+            self.envelope = np.array([[np.inf] * 3, [-np.inf] * 3])
 
     def set_vertices(self, vertices: np.ndarray) -> None:
         """Replace all vertex positions and rebuild the derived broad-phase bounds."""
@@ -321,6 +301,7 @@ class TetrahedralMesh:
         self.vertices += offset
         self.bounds[:, :3] += offset
         self.bounds[:, 3:] += offset
+        self.envelope += offset
 
     def apply_transform(self, matrix: np.ndarray) -> None:
         """Apply a homogeneous transform to all vertices and rebuild their AABBs."""
@@ -476,16 +457,7 @@ class CollisionDetector:
                 centered_moving_vertices, principal_axes
             )
             relative_positions = aligned_moving_vertices - aligned_origins
-            relative_position_columns = relative_positions.transpose(1, 2)
-            try:
-                unit_frame_columns = torch.linalg.solve(
-                    edge_matrices, relative_position_columns
-                )
-                relative_positions = unit_frame_columns.transpose(1, 2)
-            except torch.linalg.LinAlgError:
-                pass
-
-            model_inputs = relative_positions.flatten(1)
+            model_inputs = _unit_coordinates(edge_matrices, relative_positions).flatten(1)
             logits = self.model(model_inputs)
         return logits.argmax(dim=1) == 0
 
@@ -504,26 +476,24 @@ class VisualizationManager:
         self.headless = False
 
     def initialize(self, force_headless: bool = False) -> None:
-        """Initialize an interactive backend, falling back to headless EGL when needed."""
-        quiet = not logger.isEnabledFor(logging.DEBUG)
+        """Create a desktop window unless the caller explicitly requests PNG output."""
+        backend = "openGL3_egl" if force_headless else "openGL3_glfw"
+        ps.set_program_name("Tetrahedral Collision Simulator")
+        ps.set_allow_headless_backends(force_headless)
         if not force_headless:
-            try:
-                with quiet_native_stdout(quiet):
-                    ps.init()
-                self.headless = ps.is_headless()
-                return
-            except RuntimeError as e:
-                logger.warning(
-                    "Interactive Polyscope backend unavailable (%s); falling back to headless EGL.",
-                    e,
-                )
-        ps.set_allow_headless_backends(True)
-        with quiet_native_stdout(quiet):
-            ps.init("openGL3_egl")
+            ps.set_give_focus_on_show(True)
+        logger.debug("Initializing Polyscope: %s", backend)
+        try:
+            ps.init(backend)
+        except RuntimeError as exc:
+            if force_headless:
+                raise
+            raise RuntimeError(
+                "Could not open a GLFW window. For PNG output instead, use --headless."
+            ) from exc
         self.headless = ps.is_headless()
-        logger.info(
-            "Polyscope running headless; frames must be captured with screenshots."
-        )
+        if self.headless and not force_headless:
+            raise RuntimeError("An interactive window was requested, but Polyscope is headless.")
 
     def register(self, mesh: TetrahedralMesh) -> None:
         """Register ``mesh`` as a colored Polyscope volume mesh."""
@@ -543,84 +513,124 @@ class VisualizationManager:
             "collisions", colors, defined_on="cells", enabled=True
         )
 
+    def refresh(self, simulator: TetrahedralCollisionSimulator) -> None:
+        """Display the current positions and collisions after a step or reset."""
+        for column, mesh in enumerate(simulator.meshes):
+            self.sync_positions(mesh)
+            self.shade_collisions(mesh, simulator.collision_pairs[:, column])
+
 
 # --------------------------------------------------------------------------- #
 # Simulation
 # --------------------------------------------------------------------------- #
 
+# Integer (N, 2) rows: column 0 is the static cell, column 1 the moving cell.
+CandidatePairs = Union[np.ndarray, torch.Tensor]
 _NO_PAIRS = np.empty((0, 2), dtype=np.int64)
 
 
-def _bulk_tree_intersections(tree, bounds: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Return all Rtree intersections for ``(n, 6)`` AABBs in one vector query.
+class SpatialHashGrid:
+    """Sort-based uniform grid over static AABBs, queried entirely with torch ops.
 
-    The first returned array stores matching tree IDs, grouped by query. The second
-    stores the number of IDs in each group. This calls Rtree's native vector API
-    directly because ``Index.intersection_v`` can pass a NumPy scalar to
-    ``ndarray.resize`` when dense results outgrow its initial buffer.
+    Every AABB is inserted into each cell it touches; cells are keyed by their exact
+    linear index, so there are no hash collisions. A pair found in several shared cells
+    is reported only from the cell owning ``max(min_a, min_b)``, so the result matches
+    an inclusive AABB-overlap query with no duplicates.
     """
-    # Normalize the bounds into the dtype, shape, and contiguous layout expected by
-    # libspatialindex. Keeping these arrays alive also keeps the pointers below valid.
-    minima, maxima = tree._prepare_v_arrays(bounds[:, :3], bounds[:, 3:])
-    query_count, dimensions = minima.shape
-    if query_count == 0:
-        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.uint64)
 
-    # The C API walks the two-dimensional coordinate arrays using strides measured
-    # in elements rather than bytes, hence the division by NumPy's item size.
-    row_stride = minima.strides[0] // minima.itemsize
-    column_stride = minima.strides[1] // minima.itemsize
+    # Limit same-cell expansion per batch, independently of model inference batching.
+    _QUERY_BATCH_SIZE = 2048
 
-    # Rtree's wrapper starts with room for two matches per query. ``intersection_ids``
-    # grows when that estimate is too small; ``intersection_counts`` always has one
-    # slot per query and tells us how the flat ID array is partitioned.
-    intersection_ids = np.empty(2 * query_count, dtype=np.int64)
-    intersection_counts = np.empty(query_count, dtype=np.uint64)
-
-    # libspatialindex writes the number of fully completed queries through this pointer.
-    processed_query_count = ctypes.c_int64(0)
-    query_offset = 0
-    result_offset = 0
-
-    while True:
-        # Resume at the first unfinished query and the first unused result slot. The
-        # ``.ctypes.data`` values are raw addresses into the live NumPy allocations;
-        # the native call does not retain them after returning.
-        rtree_core.rt.Index_Intersects_id_v(
-            tree.handle,
-            query_count - query_offset,
-            dimensions,
-            len(intersection_ids) - result_offset,
-            row_stride,
-            column_stride,
-            minima[query_offset:].ctypes.data,
-            maxima[query_offset:].ctypes.data,
-            intersection_ids[result_offset:].ctypes.data,
-            intersection_counts[query_offset:].ctypes.data,
-            ctypes.byref(processed_query_count),
+    def __init__(self, bounds: np.ndarray, device: str):
+        """Bucket ``(n, 6)`` static ``bounds`` on ``device``."""
+        self.device = device
+        self.boxes = torch.as_tensor(bounds, dtype=torch.float64, device=device)
+        self.lower = self.boxes[:, :3].min(dim=0).values
+        self.upper = self.boxes[:, 3:].max(dim=0).values
+        extents = self.boxes[:, 3:] - self.boxes[:, :3]
+        self.cell_size = float(extents.max(dim=1).values.mean()) or 1.0
+        self.dims = ((self.upper - self.lower) / self.cell_size).floor().long() + 1
+        box_ids, keys, lower_faces = self._expand(self.boxes)
+        self.keys, order = torch.sort(keys)
+        self.box_ids = box_ids[order]
+        self.lower_faces = lower_faces[order]
+        # Direct bucket ranges avoid two binary searches per query entry. Keep the
+        # sorted-key lookup for sparse grids where an offset table would be larger.
+        cell_count = math.prod(self.dims.tolist())
+        self.cell_offsets = (
+            torch.searchsorted(self.keys, torch.arange(cell_count + 1, device=device))
+            if cell_count <= len(keys)
+            else None
         )
-        if processed_query_count.value == query_count - query_offset:
-            populated_result_count = int(intersection_counts.sum())
-            return (
-                intersection_ids[:populated_result_count],
-                intersection_counts,
-            )
 
-        # A full output buffer may stop partway through the query list. Preserve the
-        # IDs belonging to every fully completed query, then resume from the blocked
-        # query. Its count slot contains the capacity required for that query.
-        completed_slice = slice(
-            query_offset, query_offset + processed_query_count.value
+    def _cells(self, points: torch.Tensor) -> torch.Tensor:
+        """Return integer cell coordinates of ``(n, 3)`` points, clamped to the grid."""
+        cells = ((points - self.lower) / self.cell_size).floor().long()
+        return torch.minimum(cells.clamp_min(0), self.dims - 1)
+
+    def _key(self, cells: torch.Tensor) -> torch.Tensor:
+        """Linearize ``(n, 3)`` cell coordinates."""
+        return cells[:, 0] + self.dims[0] * (cells[:, 1] + self.dims[1] * cells[:, 2])
+
+    def _expand(self, boxes: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return box ID, cell key and lower-face bits for each occupied cell."""
+        lo = self._cells(boxes[:, :3])
+        span = self._cells(boxes[:, 3:]) - lo + 1
+        counts = span.prod(dim=1)
+        box_ids = torch.repeat_interleave(
+            torch.arange(len(boxes), device=self.device), counts
         )
-        result_offset += int(intersection_counts[completed_slice].sum())
-        query_offset += processed_query_count.value
-        blocked_query_size = int(intersection_counts[query_offset])
+        local = torch.arange(len(box_ids), device=self.device) - (
+            torch.cumsum(counts, 0) - counts
+        )[box_ids]
+        span_x, span_y = span[box_ids, 0], span[box_ids, 1]
+        offsets = torch.stack(
+            (local % span_x, (local // span_x) % span_y, local // (span_x * span_y)),
+            dim=1,
+        )
+        on_lower = (offsets == 0).to(torch.uint8)
+        lower_faces = on_lower[:, 0] | (on_lower[:, 1] << 1) | (on_lower[:, 2] << 2)
+        return box_ids, self._key(lo[box_ids] + offsets), lower_faces
 
-        # Grow in place so completed IDs remain intact. The explicit ``int`` is the
-        # dense-result bug fix: NumPy rejects Rtree's uint64 scalar as a resize shape.
-        # ``refcheck=False`` is safe here because the native call retained no pointer.
-        new_capacity = 2 * len(intersection_ids) + blocked_query_size
-        intersection_ids.resize(new_capacity, refcheck=False)
+    def query(self, bounds: torch.Tensor) -> torch.Tensor:
+        """Return ``(n, 2)`` static/moving indices whose AABBs overlap."""
+        in_grid = (bounds[:, 3:] >= self.lower).all(dim=1) & (
+            bounds[:, :3] <= self.upper
+        ).all(dim=1)
+        moving_query_indices = torch.nonzero(in_grid).squeeze(1)
+        if not len(moving_query_indices):
+            return bounds.new_empty((0, 2), dtype=torch.long)
+        batches = [
+            self._query_batch(bounds, ids)
+            for ids in moving_query_indices.split(self._QUERY_BATCH_SIZE)
+        ]
+        return batches[0] if len(batches) == 1 else torch.cat(batches)
+
+    def _query_batch(self, bounds: torch.Tensor, moving_ids: torch.Tensor) -> torch.Tensor:
+        entry_boxes, entry_keys, lower_faces = self._expand(bounds[moving_ids])
+        if self.cell_offsets is None:
+            first = torch.searchsorted(self.keys, entry_keys, side="left")
+            counts = torch.searchsorted(self.keys, entry_keys, side="right") - first
+        else:
+            first = self.cell_offsets[entry_keys]
+            counts = self.cell_offsets[entry_keys + 1] - first
+        entry = torch.repeat_interleave(
+            torch.arange(len(entry_keys), device=self.device), counts
+        )
+        slot = first[entry] + (
+            torch.arange(len(entry), device=self.device)
+            - (torch.cumsum(counts, 0) - counts)[entry]
+        )
+        # A shared cell owns the pair iff it is the lower cell of at least one box
+        # on each axis. Reject other cells before gathering the six float64 bounds.
+        owner = (self.lower_faces[slot] | lower_faces[entry]) == 0b111
+        static_indices = self.box_ids[slot[owner]]
+        moving_indices = moving_ids[entry_boxes[entry[owner]]]
+        static_boxes = self.boxes[static_indices]
+        moving_boxes = bounds[moving_indices]
+        keep = (static_boxes[:, :3] <= moving_boxes[:, 3:]).all(dim=1)
+        keep &= (moving_boxes[:, :3] <= static_boxes[:, 3:]).all(dim=1)
+        return torch.stack((static_indices[keep], moving_indices[keep]), dim=1)
 
 
 @dataclass
@@ -642,9 +652,7 @@ class StepStats:
 class TetrahedralCollisionSimulator:
     """Advance two meshes through collision detection and retain per-step results.
 
-    The simulator owns geometry and detection state. Polyscope rendering is reached only
-    through the visualization bridge at the end of the class; interactive playback is
-    owned separately by :class:`PolyscopeSimulationUI`.
+    The simulator owns geometry and detection state. Callers decide when to render it.
     """
 
     def __init__(
@@ -659,21 +667,15 @@ class TetrahedralCollisionSimulator:
         self.detector = detector
         self.static_mesh = static_mesh
         self.moving_mesh = moving_mesh
-        self.visualization_manager = VisualizationManager(config)
         self.step_size = -config.initial_offset / config.num_steps
         self.home_vertices = [mesh.vertices.copy() for mesh in self.meshes]
         self._refresh_static_acceleration()
-        self.moving_connectivity_device = (
-            torch.as_tensor(
-                self.moving_mesh.tetrahedra,
-                dtype=torch.long,
-                device=self.detector.device,
-            )
-            if self.detector.is_cuda
-            else None
+        self.static_cells, self.moving_cells = (
+            torch.as_tensor(mesh.tetrahedra, dtype=torch.long, device=detector.device)
+            for mesh in self.meshes
         )
         self.current_step = 0
-        self.candidate_pairs = _NO_PAIRS
+        self.candidate_pairs: CandidatePairs = _NO_PAIRS
         self.collision_pairs = _NO_PAIRS
         self.history: List[StepStats] = []
         self.run_started: Optional[float] = None
@@ -686,132 +688,57 @@ class TetrahedralCollisionSimulator:
     # Collision detection
 
     def _refresh_static_acceleration(self) -> None:
-        """Rebuild static bounds, its Rtree, and cached detector frames after movement."""
-        self.static_mesh_bounds = np.concatenate(
-            (
-                self.static_mesh.vertices.min(axis=0),
-                self.static_mesh.vertices.max(axis=0),
-            )
-        )
-        self.static_bounds_tree = trimesh.util.bounds_tree(self.static_mesh.bounds)
+        """Rebuild the broad-phase index and cached detector frames after movement."""
+        self.build_broad_phase_index()
         self.detector.prepare_static(
             self.static_mesh.vertices[self.static_mesh.tetrahedra]
         )
 
-    def broad_phase(self) -> np.ndarray:
-        """Return ``(n, 2)`` static/moving cell indices whose AABBs overlap."""
-        moving_bounds = self.moving_mesh.bounds
-        overlaps_static_bounds = np.all(
-            moving_bounds[:, 3:] >= self.static_mesh_bounds[:3], axis=1
-        )
-        overlaps_static_bounds &= np.all(
-            moving_bounds[:, :3] <= self.static_mesh_bounds[3:], axis=1
-        )
-        moving_query_indices = np.flatnonzero(overlaps_static_bounds)
-        if len(moving_query_indices) == 0:
+    def build_broad_phase_index(self) -> None:
+        """Rebuild the hash grid from the current static bounds."""
+        self.static_hash_grid = SpatialHashGrid(self.static_mesh.bounds, self.detector.device)
+
+    def broad_phase(self) -> CandidatePairs:
+        """Return ``(n, 2)`` static/moving cell indices whose AABBs overlap.
+
+        The hash grid result stays on the device as a tensor when running on CUDA.
+        """
+        static_min, static_max = self.static_mesh.envelope
+        moving_min, moving_max = self.moving_mesh.envelope
+        if np.any(moving_min > static_max) or np.any(static_min > moving_max):
+            if self.detector.is_cuda:
+                return torch.as_tensor(_NO_PAIRS, device=self.detector.device)
             return _NO_PAIRS
+        moving_bounds = torch.as_tensor(
+            self.moving_mesh.bounds, dtype=torch.float64, device=self.detector.device
+        )
+        pairs = self.static_hash_grid.query(moving_bounds)
+        return pairs if self.detector.is_cuda else pairs.numpy()
 
-        if len(moving_query_indices) < 0.75 * len(moving_bounds):
-            query_bounds = moving_bounds[moving_query_indices]
-        else:
-            query_bounds = moving_bounds
-            moving_query_indices = np.arange(len(moving_bounds), dtype=np.int64)
-        static_indices, matches_per_moving_tetrahedron = _bulk_tree_intersections(
-            self.static_bounds_tree, query_bounds
-        )
-        moving_indices = np.repeat(
-            moving_query_indices,
-            matches_per_moving_tetrahedron.astype(np.intp, copy=False),
-        )
-        return np.column_stack((static_indices, moving_indices)).astype(
-            np.int64, copy=False
-        )
-
-    def narrow_phase(self, candidates: np.ndarray) -> np.ndarray:
-        """Return the subset of ``candidates`` that the model classifies as intersecting."""
+    def narrow_phase(self, candidates: CandidatePairs) -> np.ndarray:
+        """Classify (static, moving) cell IDs on the detector device and return hits on CPU."""
         if len(candidates) == 0:
-            return candidates
-        if self.detector.is_cuda:
-            return self._narrow_phase_cuda(candidates)
-
-        static_candidate_indices = candidates[:, 0]
-        moving_candidate_indices = candidates[:, 1]
-        if self.detector.pca_unit_frames is not None:
-            collision_mask = np.concatenate(
-                [
-                    self.detector.classify_pca_unit(
-                        static_candidate_indices[
-                            offset : offset + self.config.batch_size
-                        ],
-                        self.moving_mesh.vertices[
-                            self.moving_mesh.tetrahedra[
-                                moving_candidate_indices[
-                                    offset : offset + self.config.batch_size
-                                ]
-                            ]
-                        ],
-                    )
-                    for offset in range(0, len(candidates), self.config.batch_size)
-                ]
-            )
-            return candidates[collision_mask]
-
-        static_vertices = self.static_mesh.corners_of(static_candidate_indices)
-        moving_vertices = self.moving_mesh.corners_of(moving_candidate_indices)
-        pair_data = torch.from_numpy(
-            np.concatenate([static_vertices, moving_vertices], axis=1)
+            return _NO_PAIRS
+        device, dtype = self.detector.device, self.detector.dtype
+        pairs = torch.as_tensor(candidates, dtype=torch.long, device=device)
+        moving_vertices = torch.as_tensor(self.moving_mesh.vertices, dtype=dtype, device=device)
+        static_vertices = (
+            torch.as_tensor(self.static_mesh.vertices, dtype=dtype, device=device)
+            if self.detector.pca_unit_frames is None
+            else None
         )
-        collision_mask = np.concatenate(
-            [
-                self.detector.classify(
-                    pair_data[offset : offset + self.config.batch_size]
-                )
-                for offset in range(0, len(candidates), self.config.batch_size)
-            ]
-        )
-        return candidates[collision_mask]
-
-    def _narrow_phase_cuda(self, candidates: np.ndarray) -> np.ndarray:
-        """Classify candidates on CUDA and copy only the final collision mask to the host."""
-        candidate_pairs_device = torch.as_tensor(
-            candidates, dtype=torch.long, device=self.detector.device
-        )
-        hit_batches = []
-
-        if self.detector.pca_unit_frames is not None:
-            all_moving_vertices = torch.as_tensor(
-                self.moving_mesh.vertices,
-                dtype=self.detector.dtype,
-                device=self.detector.device,
-            )
-            all_moving_tetrahedra = all_moving_vertices[self.moving_connectivity_device]
-
-            for offset in range(0, len(candidates), self.config.batch_size):
-                candidate_batch = candidate_pairs_device[
-                    offset : offset + self.config.batch_size
-                ]
-                static_indices = candidate_batch[:, 0]
-                moving_indices = candidate_batch[:, 1]
-                moving_batch = all_moving_tetrahedra[moving_indices]
-                hit_batches.append(
-                    self.detector.classify_pca_unit_tensor(static_indices, moving_batch)
-                )
-        else:
-            static_vertices = self.static_mesh.corners_of(candidates[:, 0])
-            moving_vertices = self.moving_mesh.corners_of(candidates[:, 1])
-            flattened_pairs = np.concatenate([static_vertices, moving_vertices], axis=1)
-            pair_data_device = torch.as_tensor(
-                flattened_pairs,
-                dtype=self.detector.dtype,
-                device=self.detector.device,
-            )
-
-            for offset in range(0, len(candidates), self.config.batch_size):
-                pair_batch = pair_data_device[offset : offset + self.config.batch_size]
-                hit_batches.append(self.detector.classify_tensor(pair_batch))
-
-        collision_mask = torch.cat(hit_batches).cpu().numpy()
-        return candidates[collision_mask]
+        hit_masks = []
+        for batch in pairs.split(self.config.batch_size):
+            static_ids, moving_ids = batch.unbind(dim=1)
+            moving_batch = moving_vertices[self.moving_cells[moving_ids]]
+            if static_vertices is None:
+                hits = self.detector.classify_pca_unit_tensor(static_ids, moving_batch)
+            else:
+                static_batch = static_vertices[self.static_cells[static_ids]]
+                pair_data = torch.cat((static_batch, moving_batch), dim=1).flatten(1)
+                hits = self.detector.classify_tensor(pair_data)
+            hit_masks.append(hits)
+        return pairs[torch.cat(hit_masks)].cpu().numpy()
 
     def detect_collisions(self) -> Tuple[float, float]:
         """Run both detection phases, store their pairs, and return phase durations."""
@@ -826,7 +753,7 @@ class TetrahedralCollisionSimulator:
     # Simulation lifecycle
 
     def step_forward(self) -> None:
-        """Advance one frame, detect collisions, refresh rendering, and record timings."""
+        """Advance one frame, detect collisions, and record timings."""
         if self.current_step >= self.config.num_steps:
             return
         if self.run_started is None:
@@ -843,7 +770,6 @@ class TetrahedralCollisionSimulator:
             self._refresh_static_acceleration()
 
         broad_s, narrow_s = self.detect_collisions()
-        self.refresh_visualization()
         self.current_step += 1
         self._log_step(broad_s, narrow_s)
 
@@ -860,7 +786,6 @@ class TetrahedralCollisionSimulator:
         for mesh, home in zip(self.meshes, self.home_vertices):
             mesh.set_vertices(home.copy())
         self._refresh_static_acceleration()
-        self.refresh_visualization()
         logger.info("Simulation reset.")
 
     # Reporting
@@ -945,23 +870,6 @@ class TetrahedralCollisionSimulator:
             slowest.detection_s,
         )
 
-    # Visualization bridge
-
-    def initialize_visualization(self, force_headless: bool = False) -> None:
-        """Initialize Polyscope and register both meshes for subsequent frame updates."""
-        self.visualization_manager.initialize(force_headless)
-        for mesh in self.meshes:
-            self.visualization_manager.register(mesh)
-
-    def refresh_visualization(self) -> None:
-        """Push current vertices and per-cell collision colors to Polyscope."""
-        for column, mesh in enumerate(self.meshes):
-            self.visualization_manager.sync_positions(mesh)
-            self.visualization_manager.shade_collisions(
-                mesh, self.collision_pairs[:, column]
-            )
-
-
 # --------------------------------------------------------------------------- #
 # Interactive UI
 # --------------------------------------------------------------------------- #
@@ -970,101 +878,63 @@ class TetrahedralCollisionSimulator:
 class PolyscopeSimulationUI:
     """Own the interactive playback state and render Polyscope's ImGui controls."""
 
-    def __init__(self, simulator: TetrahedralCollisionSimulator):
+    def __init__(self, simulator: TetrahedralCollisionSimulator, viewer: VisualizationManager):
         """Attach controls to ``simulator`` with playback initially paused."""
         self.simulator = simulator
+        self.viewer = viewer
         self.is_playing = False
+        self._first_frame = True
 
     @staticmethod
-    def _draw_current_step_pipeline(history: Sequence[StepStats]) -> None:
-        """Draw the broad-to-narrow funnel for the most recently completed step."""
-        psim.Separator()
-        psim.TextUnformatted("Current Step Pipeline")
-        if not history:
-            psim.TextUnformatted("No completed steps yet.")
+    def _draw_phase_stats(stats: StepStats) -> None:
+        """Show pair counts and timings for the pose on screen."""
+        flags = psim.ImGuiTableFlags_SizingFixedFit | psim.ImGuiTableFlags_RowBg
+        if not psim.BeginTable("##collision_phases", 3, flags):
             return
-
-        latest_stats = history[-1]
-        psim.Text(
-            f"Candidates Found: {latest_stats.candidates:,}  "
-            f"(broad: {latest_stats.broad_s * 1e3:.2f} ms)"
-        )
-        psim.TextUnformatted("  ->")
-        psim.Text(
-            f"Actual Collisions: {latest_stats.collisions:,}  "
-            f"(narrow: {latest_stats.narrow_s * 1e3:.2f} ms)"
-        )
-        if latest_stats.candidates:
-            filtered_count = latest_stats.candidates - latest_stats.collisions
-            filtered_percentage = 100.0 * filtered_count / latest_stats.candidates
-            psim.Text(
-                f"Filtered Out: {filtered_count:,} ({filtered_percentage:.1f}%)"
-            )
-        else:
-            psim.TextUnformatted("Filtered Out: 0 (N/A; no candidates)")
-
-    @staticmethod
-    def _draw_aggregate_metrics(history: Sequence[StepStats]) -> None:
-        """Draw cumulative and per-step detection timings split across both phases."""
-        psim.Separator()
-        psim.TextUnformatted("Aggregate Metrics")
-        if not history:
-            psim.TextUnformatted("No completed steps yet.")
-            return
-
-        total_broad_s = sum(stats.broad_s for stats in history)
-        total_narrow_s = sum(stats.narrow_s for stats in history)
-        total_detection_s = total_broad_s + total_narrow_s
-        psim.Text(f"Total Detection Time: {total_detection_s:.2f} s")
-
-        if total_detection_s > 0.0:
-            broad_share = 100.0 * total_broad_s / total_detection_s
-            psim.Text(
-                f"Time Split: {broad_share:.0f}% Broad / "
-                f"{100.0 - broad_share:.0f}% Narrow"
-            )
-        else:
-            psim.TextUnformatted("Time Split: N/A (no measured time)")
-
-        completed_steps = len(history)
-        psim.Text(f"Avg Broad/Step:  {total_broad_s / completed_steps * 1e3:.2f} ms")
-        psim.Text(f"Avg Narrow/Step: {total_narrow_s / completed_steps * 1e3:.2f} ms")
-        psim.Text(
-            f"Avg Total/Step:  {total_detection_s / completed_steps * 1e3:.2f} ms"
-        )
+        for header in ("Phase", "Pairs", "Time"):
+            psim.TableSetupColumn(header)
+        psim.TableHeadersRow()
+        for label, count, seconds in (
+            ("Broad: candidates", stats.candidates, stats.broad_s),
+            ("Narrow: model hits", stats.collisions, stats.narrow_s if stats.candidates else None),
+        ):
+            duration = "Skipped" if seconds is None else f"{seconds * 1000:,.1f} ms"
+            psim.TableNextRow()
+            for cell in (label, f"{count:,}", duration):
+                psim.TableNextColumn()
+                psim.TextUnformatted(cell)
+        psim.EndTable()
 
     def draw(self) -> None:
         """Draw one control-panel frame and advance the simulation during playback."""
         simulator = self.simulator
-        config = simulator.config
-
-        psim.Text(f"Step: {simulator.current_step}/{config.num_steps}")
-        psim.Text(f"Transforms: {' -> '.join(simulator.detector.transforms)}")
-        psim.Text(
-            f"Inference: {simulator.detector.device} / "
-            f"{str(simulator.detector.dtype).removeprefix('torch.')} / "
-            f"batch {config.batch_size:,}"
-        )
-
-        if self.is_playing:
-            if psim.Button("Stop"):
-                self.is_playing = False
-        elif psim.Button("Play") and simulator.current_step < config.num_steps:
-            self.is_playing = True
-
+        total = simulator.config.num_steps
+        psim.BeginDisabled(simulator.current_step >= total)
+        if psim.Button("Pause" if self.is_playing else "Play"):
+            self.is_playing = not self.is_playing
+        psim.EndDisabled()
         psim.SameLine()
         if psim.Button("Reset"):
             self.is_playing = False
             simulator.reset_simulation()
+            self.viewer.refresh(simulator)
+        elif self.is_playing:
+            simulator.step_forward()
+            self.viewer.refresh(simulator)
+            self.is_playing = simulator.current_step < total
 
-        self._draw_current_step_pipeline(simulator.history)
-        self._draw_aggregate_metrics(simulator.history)
-
-        if self.is_playing:
-            if simulator.current_step < config.num_steps:
-                simulator.step_forward()
-            else:
-                self.is_playing = False
+        step = simulator.current_step
+        state = "Running" if self.is_playing else "Paused"
+        if step >= total:
+            state = "Complete"
+        psim.ProgressBar(step / max(total, 1), overlay=f"{state}  |  Step {step}/{total}")
+        if simulator.history:
+            self._draw_phase_stats(simulator.history[-1])
+        else:
+            psim.TextDisabled("No step measured yet.")
+        if self._first_frame:
+            logger.debug("First viewer callback completed.")
+            self._first_frame = False
 
 
 STATIC_COLOR = [0.3, 0.3, 1.0]
@@ -1110,13 +980,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
 
     motion = parser.add_argument_group("simulation")
+    defaults = SimulationConfig()
     motion.add_argument(
-        "--num-steps", type=int, default=50, help="Number of simulation steps"
+        "--num-steps", type=int, default=defaults.num_steps, help="Number of simulation steps"
     )
     motion.add_argument(
         "--offset-x",
         type=float,
-        default=2.5,
+        default=defaults.initial_offset[0],
         help="Initial x offset for the moving mesh",
     )
     motion.add_argument(
@@ -1127,14 +998,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     motion.add_argument(
         "--rotation-speed",
         type=float,
-        default=np.radians(10.0),
+        default=defaults.rotation_speed,
         help="Static mesh rotation speed in radians per step",
     )
     motion.add_argument(
         "--rotation-axis",
         type=float,
         nargs=3,
-        default=[0.0, 1.0, 0.0],
+        default=defaults.rotation_axis.tolist(),
         help="Rotation axis for the static mesh",
     )
 
@@ -1179,7 +1050,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--log-level",
         choices=LOG_LEVELS,
         default="INFO",
-        help="Logging verbosity; DEBUG adds timestamps and reveals Polyscope's banner",
+        help="Logging verbosity; DEBUG traces viewer startup and the first UI frame",
     )
     return parser.parse_args(argv)
 
@@ -1225,14 +1096,19 @@ def main():
     simulator = TetrahedralCollisionSimulator(
         runtime.simulation, detector, static_mesh, moving_mesh
     )
-    simulator.initialize_visualization(force_headless=runtime.headless)
+    viewer = VisualizationManager(runtime.simulation)
+    viewer.initialize(force_headless=runtime.headless)
+    for mesh in simulator.meshes:
+        logger.debug("Registering %s with Polyscope", mesh.name)
+        viewer.register(mesh)
 
-    if simulator.visualization_manager.headless:
+    if viewer.headless:
         out_dir = runtime.screenshot_dir
         out_dir.mkdir(parents=True, exist_ok=True)
         ps.screenshot(str(out_dir / "step_000.png"))
         for _ in range(runtime.simulation.num_steps):
             simulator.step_forward()
+            viewer.refresh(simulator)
             ps.screenshot(str(out_dir / f"step_{simulator.current_step:03d}.png"))
         logger.info(
             "Wrote %d frames to %s",
@@ -1241,8 +1117,9 @@ def main():
         )
         return
 
-    simulation_ui = PolyscopeSimulationUI(simulator)
+    simulation_ui = PolyscopeSimulationUI(simulator, viewer)
     ps.set_user_callback(simulation_ui.draw)
+    logger.debug("Both meshes registered; entering the viewer event loop.")
     ps.show()
 
 
